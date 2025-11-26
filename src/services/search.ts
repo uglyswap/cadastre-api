@@ -12,6 +12,7 @@ import { enrichSiren } from './entreprises-api.js';
 import {
   LocalRaw,
   Propriete,
+  ProprieteGroupee,
   Adresse,
   ReferenceCadastrale,
   LocalisationLocal,
@@ -88,21 +89,63 @@ function transformToPropiete(raw: LocalRaw): Propriete {
   return { adresse, reference_cadastrale, localisation, proprietaire };
 }
 
+// Déduplique les propriétés en les groupant par adresse
+function groupProprietesParAdresse(proprietes: Propriete[]): ProprieteGroupee[] {
+  const grouped = new Map<string, ProprieteGroupee>();
+
+  for (const prop of proprietes) {
+    const key = prop.adresse.adresse_complete;
+
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        adresse: prop.adresse,
+        references_cadastrales: [],
+        localisations: [],
+        nombre_lots: 0,
+      });
+    }
+
+    const entry = grouped.get(key)!;
+
+    // Vérifier si cette référence cadastrale est déjà présente
+    const refComplete = prop.reference_cadastrale.reference_complete;
+    const refExists = entry.references_cadastrales.some(
+      r => r.reference_complete === refComplete
+    );
+
+    if (!refExists) {
+      entry.references_cadastrales.push(prop.reference_cadastrale);
+      entry.localisations.push(prop.localisation);
+    }
+
+    entry.nombre_lots++;
+  }
+
+  return Array.from(grouped.values());
+}
+
 // Recherche par adresse
 export async function searchByAddress(
   adresse: string,
   departement?: string,
   limit?: number
 ): Promise<{
-  proprietaires: Map<string, { proprietaire: Proprietaire; proprietes: Propriete[]; entreprise?: EntrepriseEnrichie }>;
-  total: number;
+  resultats: Array<{
+    proprietaire: Proprietaire;
+    proprietes: ProprieteGroupee[];
+    entreprise?: EntrepriseEnrichie;
+    nombre_adresses: number;
+    nombre_lots: number;
+  }>;
+  total_proprietaires: number;
+  total_lots: number;
 }> {
   const maxResults = limit || config.search.maxLimit;
   const normalizedSearch = normalizeForSearch(adresse);
   const searchTerms = normalizedSearch.split(' ').filter(t => t.length >= 2);
 
   if (searchTerms.length === 0) {
-    return { proprietaires: new Map(), total: 0 };
+    return { resultats: [], total_proprietaires: 0, total_lots: 0 };
   }
 
   // Déterminer les tables à interroger
@@ -114,7 +157,7 @@ export async function searchByAddress(
   }
 
   if (tables.length === 0) {
-    return { proprietaires: new Map(), total: 0 };
+    return { resultats: [], total_proprietaires: 0, total_lots: 0 };
   }
 
   // Construire la requête avec recherche fuzzy sur le nom de voie
@@ -164,10 +207,16 @@ export async function searchByAddress(
     }
   }
 
-  // Enrichir avec API Entreprises
-  const enrichedMap = new Map<string, { proprietaire: Proprietaire; proprietes: Propriete[]; entreprise?: EntrepriseEnrichie }>();
+  // Enrichir avec API Entreprises et dédupliquer par adresse
+  const resultats: Array<{
+    proprietaire: Proprietaire;
+    proprietes: ProprieteGroupee[];
+    entreprise?: EntrepriseEnrichie;
+    nombre_adresses: number;
+    nombre_lots: number;
+  }> = [];
 
-  for (const [key, value] of proprietairesMap) {
+  for (const [_, value] of proprietairesMap) {
     let entreprise: EntrepriseEnrichie | undefined;
 
     // Enrichir si on a un SIREN valide
@@ -177,14 +226,24 @@ export async function searchByAddress(
       if (enriched) entreprise = enriched;
     }
 
-    enrichedMap.set(key, {
+    // Grouper les propriétés par adresse
+    const proprietesGroupees = groupProprietesParAdresse(value.proprietes);
+    const nombreLots = value.proprietes.length;
+
+    resultats.push({
       proprietaire: value.proprietaire,
-      proprietes: value.proprietes,
+      proprietes: proprietesGroupees,
       entreprise,
+      nombre_adresses: proprietesGroupees.length,
+      nombre_lots: nombreLots,
     });
   }
 
-  return { proprietaires: enrichedMap, total: results.length };
+  return {
+    resultats,
+    total_proprietaires: resultats.length,
+    total_lots: results.length,
+  };
 }
 
 // Recherche par propriétaire (SIREN)
@@ -194,11 +253,13 @@ export async function searchBySiren(
 ): Promise<{
   proprietaire?: Proprietaire;
   entreprise?: EntrepriseEnrichie;
-  proprietes: Propriete[];
+  proprietes: ProprieteGroupee[];
+  nombre_adresses: number;
+  nombre_lots: number;
   departements_concernes: string[];
 }> {
   if (!siren || siren.length !== 9) {
-    return { proprietes: [], departements_concernes: [] };
+    return { proprietes: [], nombre_adresses: 0, nombre_lots: 0, departements_concernes: [] };
   }
 
   // Déterminer les tables à interroger
@@ -227,7 +288,7 @@ export async function searchBySiren(
   }
 
   if (results.length === 0) {
-    return { proprietes: [], departements_concernes: [] };
+    return { proprietes: [], nombre_adresses: 0, nombre_lots: 0, departements_concernes: [] };
   }
 
   const proprietes = results.map(transformToPropiete);
@@ -236,10 +297,15 @@ export async function searchBySiren(
   // Enrichir avec API Entreprises
   const entreprise = await enrichSiren(siren) || undefined;
 
+  // Grouper les propriétés par adresse
+  const proprietesGroupees = groupProprietesParAdresse(proprietes);
+
   return {
     proprietaire,
     entreprise,
-    proprietes,
+    proprietes: proprietesGroupees,
+    nombre_adresses: proprietesGroupees.length,
+    nombre_lots: results.length,
     departements_concernes: Array.from(departementsSet).sort(),
   };
 }
@@ -253,17 +319,20 @@ export async function searchByDenomination(
   resultats: Array<{
     proprietaire: Proprietaire;
     entreprise?: EntrepriseEnrichie;
-    proprietes: Propriete[];
+    proprietes: ProprieteGroupee[];
+    nombre_adresses: number;
+    nombre_lots: number;
     departements_concernes: string[];
   }>;
-  total: number;
+  total_proprietaires: number;
+  total_lots: number;
 }> {
   const maxResults = limit || config.search.maxLimit;
   const normalizedSearch = normalizeForSearch(denomination);
   const searchTerms = normalizedSearch.split(' ').filter(t => t.length >= 2);
 
   if (searchTerms.length === 0) {
-    return { resultats: [], total: 0 };
+    return { resultats: [], total_proprietaires: 0, total_lots: 0 };
   }
 
   // Déterminer les tables à interroger
@@ -313,11 +382,13 @@ export async function searchByDenomination(
     if (raw.département) entry.departements.add(raw.département);
   }
 
-  // Transformer et enrichir
+  // Transformer et enrichir avec déduplication par adresse
   const resultats: Array<{
     proprietaire: Proprietaire;
     entreprise?: EntrepriseEnrichie;
-    proprietes: Propriete[];
+    proprietes: ProprieteGroupee[];
+    nombre_adresses: number;
+    nombre_lots: number;
     departements_concernes: string[];
   }> = [];
 
@@ -333,13 +404,22 @@ export async function searchByDenomination(
       if (enriched) entreprise = enriched;
     }
 
+    // Grouper les propriétés par adresse
+    const proprietesGroupees = groupProprietesParAdresse(proprietes);
+
     resultats.push({
       proprietaire,
       entreprise,
-      proprietes,
+      proprietes: proprietesGroupees,
+      nombre_adresses: proprietesGroupees.length,
+      nombre_lots: value.rows.length,
       departements_concernes: Array.from(value.departements).sort(),
     });
   }
 
-  return { resultats, total: results.length };
+  return {
+    resultats,
+    total_proprietaires: resultats.length,
+    total_lots: results.length,
+  };
 }

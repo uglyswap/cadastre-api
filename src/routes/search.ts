@@ -38,15 +38,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       try {
-        const { proprietaires, total } = await searchByAddress(adresse, departement, limit);
-
-        // Convertir la Map en tableau pour la réponse JSON
-        const resultats = Array.from(proprietaires.values()).map(entry => ({
-          proprietaire: entry.proprietaire,
-          entreprise: entry.entreprise,
-          proprietes: entry.proprietes,
-          nombre_proprietes: entry.proprietes.length,
-        }));
+        const { resultats, total_proprietaires, total_lots } = await searchByAddress(adresse, departement, limit);
 
         return reply.send({
           success: true,
@@ -54,9 +46,15 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
             adresse,
             departement: departement || null,
           },
-          resultats,
-          total_proprietes: total,
-          total_proprietaires: resultats.length,
+          resultats: resultats.map(r => ({
+            proprietaire: r.proprietaire,
+            entreprise: r.entreprise,
+            proprietes: r.proprietes,
+            nombre_adresses: r.nombre_adresses,
+            nombre_lots: r.nombre_lots,
+          })),
+          total_proprietaires,
+          total_lots,
         });
       } catch (error) {
         console.error('Erreur recherche par adresse:', error);
@@ -98,7 +96,8 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           proprietaire: result.proprietaire,
           entreprise: result.entreprise,
           proprietes: result.proprietes,
-          total_proprietes: result.proprietes.length,
+          nombre_adresses: result.nombre_adresses,
+          nombre_lots: result.nombre_lots,
           departements_concernes: result.departements_concernes,
         });
       } catch (error) {
@@ -130,7 +129,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       try {
-        const { resultats, total } = await searchByDenomination(denomination, departement, limit);
+        const { resultats, total_proprietaires, total_lots } = await searchByDenomination(denomination, departement, limit);
 
         return reply.send({
           success: true,
@@ -142,11 +141,12 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
             proprietaire: r.proprietaire,
             entreprise: r.entreprise,
             proprietes: r.proprietes,
-            nombre_proprietes: r.proprietes.length,
+            nombre_adresses: r.nombre_adresses,
+            nombre_lots: r.nombre_lots,
             departements_concernes: r.departements_concernes,
           })),
-          total_proprietes: total,
-          total_proprietaires: resultats.length,
+          total_proprietaires,
+          total_lots,
         });
       } catch (error) {
         console.error('Erreur recherche par dénomination:', error);

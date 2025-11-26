@@ -72,6 +72,14 @@ export interface Propriete {
   proprietaire: Proprietaire;
 }
 
+// Propriété groupée par adresse (avec plusieurs lots/références cadastrales)
+export interface ProprieteGroupee {
+  adresse: Adresse;
+  references_cadastrales: ReferenceCadastrale[];
+  localisations: LocalisationLocal[];
+  nombre_lots: number;
+}
+
 // Types pour l'enrichissement API Entreprises
 export interface Dirigeant {
   nom: string;
@@ -132,10 +140,12 @@ export interface SearchByAddressResponse {
   resultats: Array<{
     proprietaire: Proprietaire;
     entreprise?: EntrepriseEnrichie;
-    proprietes: Propriete[];
-    nombre_proprietes: number;
+    proprietes: ProprieteGroupee[];
+    nombre_adresses: number;
+    nombre_lots: number;
   }>;
-  total: number;
+  total_proprietaires: number;
+  total_lots: number;
 }
 
 export interface SearchByOwnerResponse {
@@ -146,8 +156,9 @@ export interface SearchByOwnerResponse {
   };
   proprietaire?: Proprietaire;
   entreprise?: EntrepriseEnrichie;
-  proprietes: Propriete[];
-  total_proprietes: number;
+  proprietes: ProprieteGroupee[];
+  nombre_adresses: number;
+  nombre_lots: number;
   departements_concernes: string[];
 }
 
