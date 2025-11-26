@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  cadastre-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3002:3001"
+    environment:
+      - PORT=3001
+      - HOST=0.0.0.0
+      - DB_HOST=locaux-db-new-9vrvfz
+      - DB_PORT=5432
+      - DB_NAME=locaux_2025
+      - DB_USER=locaux_admin
+      - DB_PASSWORD=Locaux2025SecurePass
+      - MASTER_API_KEY=cadastre_master_key_2025_secure
+    networks:
+      - dokploy-network
+    restart: unless-stopped
+
+networks:
+  dokploy-network:
+    external: true
