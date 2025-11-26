@@ -1,6 +1,9 @@
 import axios, { AxiosInstance } from 'axios';
 import { config } from '../config/index.js';
-import { EntrepriseEnrichie, Dirigeant, SiegeEntreprise } from '../types/index.js';
+import { EntrepriseEnrichie, Dirigeant, SiegeEntreprise, BeneficiaireEffectif } from '../types/index.js';
+
+// Configuration pour la résolution des bénéficiaires effectifs
+const MAX_DEPTH = 5; // Profondeur max de résolution des chaînes de PM
 
 // Rate limiter simple pour respecter les 7 req/sec
 class RateLimiter {
@@ -48,7 +51,7 @@ class EntreprisesApiClient {
     this.rateLimiter = new RateLimiter(config.entreprisesApi.maxRequestsPerSecond);
   }
 
-  // Recherche une entreprise par SIREN
+  // Recherche une entreprise par SIREN (avec résolution des bénéficiaires effectifs)
   async searchBySiren(siren: string): Promise<EntrepriseEnrichie | null> {
     if (!siren || siren.length !== 9) return null;
 
@@ -65,7 +68,7 @@ class EntreprisesApiClient {
       const results = response.data?.results;
       if (!results || results.length === 0) return null;
 
-      return this.mapToEntrepriseEnrichie(results[0]);
+      return await this.mapToEntrepriseEnrichie(results[0]);
     } catch (error) {
       console.error(`Erreur API Entreprises pour SIREN ${siren}:`, error);
       return null;
@@ -89,17 +92,128 @@ class EntreprisesApiClient {
       const results = response.data?.results;
       if (!results || results.length === 0) return [];
 
-      return results.map((r: any) => this.mapToEntrepriseEnrichie(r));
+      // Mapper chaque résultat avec résolution des bénéficiaires
+      const mapped: EntrepriseEnrichie[] = [];
+      for (const r of results) {
+        mapped.push(await this.mapToEntrepriseEnrichie(r));
+      }
+      return mapped;
     } catch (error) {
       console.error(`Erreur API Entreprises pour "${denomination}":`, error);
       return [];
     }
   }
 
-  // Mappe la réponse API vers notre type
-  private mapToEntrepriseEnrichie(data: any): EntrepriseEnrichie {
+  // Récupère les dirigeants bruts d'un SIREN (pour la résolution récursive)
+  private async fetchDirigeantsRaw(siren: string): Promise<any[]> {
+    if (!siren || siren.length !== 9) return [];
+
+    await this.rateLimiter.waitForSlot();
+
+    try {
+      const response = await this.client.get('/search', {
+        params: {
+          q: siren,
+          per_page: 1,
+        },
+      });
+
+      const results = response.data?.results;
+      if (!results || results.length === 0) return [];
+
+      return results[0].dirigeants || [];
+    } catch (error) {
+      console.error(`Erreur récupération dirigeants pour SIREN ${siren}:`, error);
+      return [];
+    }
+  }
+
+  // Résout récursivement les bénéficiaires effectifs (personnes physiques finales)
+  private async resolveBeneficiairesEffectifs(
+    dirigeantsRaw: any[],
+    chaineActuelle: Array<{ siren: string; denomination: string; qualite: string }>,
+    sirensVisites: Set<string>,
+    profondeur: number
+  ): Promise<BeneficiaireEffectif[]> {
+    const beneficiaires: BeneficiaireEffectif[] = [];
+
+    for (const d of dirigeantsRaw) {
+      if (d.type_dirigeant === 'personne physique') {
+        // Personne physique trouvée -> bénéficiaire effectif
+        beneficiaires.push({
+          nom: d.nom || '',
+          prenoms: d.prenoms || '',
+          qualite: d.qualite || '',
+          annee_naissance: d.annee_de_naissance?.toString() || undefined,
+          chaine_controle: [...chaineActuelle],
+        });
+      } else if (d.type_dirigeant === 'personne morale' && d.siren) {
+        // Personne morale -> résoudre récursivement si possible
+        const sirenPM = d.siren;
+
+        // Vérifier les limites
+        if (profondeur >= MAX_DEPTH) {
+          console.log(`Profondeur max atteinte pour SIREN ${sirenPM}`);
+          continue;
+        }
+
+        if (sirensVisites.has(sirenPM)) {
+          console.log(`Cycle détecté pour SIREN ${sirenPM}, ignoré`);
+          continue;
+        }
+
+        // Marquer comme visité
+        sirensVisites.add(sirenPM);
+
+        // Récupérer les dirigeants de cette PM
+        const dirigeantsPM = await this.fetchDirigeantsRaw(sirenPM);
+
+        if (dirigeantsPM.length === 0) {
+          // Pas de dirigeants trouvés, on ne peut pas remonter plus loin
+          continue;
+        }
+
+        // Ajouter cette société à la chaîne de contrôle
+        const nouvelleChaine = [
+          ...chaineActuelle,
+          {
+            siren: sirenPM,
+            denomination: d.denomination || '',
+            qualite: d.qualite || '',
+          },
+        ];
+
+        // Résoudre récursivement
+        const beneficiairesPM = await this.resolveBeneficiairesEffectifs(
+          dirigeantsPM,
+          nouvelleChaine,
+          sirensVisites,
+          profondeur + 1
+        );
+
+        beneficiaires.push(...beneficiairesPM);
+      }
+    }
+
+    return beneficiaires;
+  }
+
+  // Mappe la réponse API vers notre type (avec résolution des bénéficiaires effectifs)
+  private async mapToEntrepriseEnrichie(data: any): Promise<EntrepriseEnrichie> {
     const siege = data.siege || {};
     const dirigeants = this.extractDirigeants(data);
+
+    // Résoudre les bénéficiaires effectifs
+    const dirigeantsRaw = data.dirigeants || [];
+    const sirensVisites = new Set<string>();
+    sirensVisites.add(data.siren); // Éviter de revisiter l'entreprise elle-même
+
+    const beneficiaires_effectifs = await this.resolveBeneficiairesEffectifs(
+      dirigeantsRaw,
+      [], // Chaîne vide au départ
+      sirensVisites,
+      0
+    );
 
     return {
       siren: data.siren || '',
@@ -113,6 +227,7 @@ class EntreprisesApiClient {
       tranche_effectif: this.decodeTrancheEffectif(data.tranche_effectif_salarie),
       siege: this.mapSiege(siege),
       dirigeants,
+      beneficiaires_effectifs,
       nombre_etablissements: data.nombre_etablissements_ouverts || 0,
     };
   }

@@ -83,6 +83,20 @@ export interface Dirigeant {
   denomination?: string; // Pour les PM
 }
 
+// Bénéficiaire effectif (personne physique finale après résolution de la chaîne)
+export interface BeneficiaireEffectif {
+  nom: string;
+  prenoms: string;
+  qualite: string;
+  annee_naissance?: string;
+  // Chaîne de contrôle: liste des sociétés intermédiaires pour arriver à cette personne
+  chaine_controle: Array<{
+    siren: string;
+    denomination: string;
+    qualite: string; // Rôle dans la société précédente
+  }>;
+}
+
 export interface SiegeEntreprise {
   adresse: string;
   code_postal: string;
@@ -103,6 +117,8 @@ export interface EntrepriseEnrichie {
   tranche_effectif: string;
   siege: SiegeEntreprise;
   dirigeants: Dirigeant[];
+  // Bénéficiaires effectifs: personnes physiques finales après résolution des chaînes de PM
+  beneficiaires_effectifs: BeneficiaireEffectif[];
   nombre_etablissements: number;
 }
 
