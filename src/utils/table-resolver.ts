@@ -44,13 +44,26 @@ export async function resolveTablesForDepartment(departement: string): Promise<s
   const tables = await fetchAvailableTables();
   const normalizedDept = normalizeDepartmentCode(departement);
 
-  // Cas spécial Paris (75): tables pb_25_b_750_*
+  // Cas spécial Paris (75): tables pb_25_b_750_* et pm_25_b_750_*
   if (normalizedDept === '75') {
-    return tables.filter(t => t.startsWith('pb_25_b_750'));
+    return tables.filter(t => t.startsWith('pb_25_b_750') || t.startsWith('pm_25_b_750'));
   }
 
-  // Départements standards: pm_25_b_XXX
-  const pattern = `pm_25_b_${normalizedDept}`;
+  // DOM-TOM (971-976): pas de zéro final - pm_25_b_971, pm_25_b_972, etc.
+  const deptNum = parseInt(normalizedDept);
+  if (deptNum >= 971) {
+    const pattern = `pm_25_b_${normalizedDept}`;
+    return tables.filter(t => t === pattern);
+  }
+
+  // Corse: pm_25_b_2a0, pm_25_b_2b0
+  if (normalizedDept === '2A' || normalizedDept === '2B') {
+    const pattern = `pm_25_b_${normalizedDept.toLowerCase()}0`;
+    return tables.filter(t => t === pattern);
+  }
+
+  // Départements métropolitains standards: pm_25_b_XXX0 (avec zéro final)
+  const pattern = `pm_25_b_${normalizedDept}0`;
   const matching = tables.filter(t => t === pattern);
 
   return matching;
@@ -63,12 +76,24 @@ export async function resolveAllTables(): Promise<string[]> {
 
 // Extrait le code département depuis un nom de table
 export function extractDepartmentFromTable(tableName: string): string {
-  // pb_25_b_750_1 -> 75
-  if (tableName.startsWith('pb_25_b_750')) return '75';
+  // pb_25_b_750_* et pm_25_b_750_* -> 75
+  if (tableName.startsWith('pb_25_b_750') || tableName.startsWith('pm_25_b_750')) return '75';
 
-  // pm_25_b_XX -> XX
-  const match = tableName.match(/pm_25_b_(\d+|2[AB])/i);
-  if (match) return match[1];
+  // DOM-TOM: pm_25_b_971, pm_25_b_972, etc. (pas de zéro final)
+  const domTomMatch = tableName.match(/pm_25_b_(97[1-6])$/);
+  if (domTomMatch) return domTomMatch[1];
+
+  // Corse: pm_25_b_2a0, pm_25_b_2b0 -> 2A, 2B
+  const corseMatch = tableName.match(/pm_25_b_(2[ab])0$/i);
+  if (corseMatch) return corseMatch[1].toUpperCase();
+
+  // Départements métropolitains: pm_25_b_XXX0 -> XX (enlever le zéro final)
+  const metroMatch = tableName.match(/pm_25_b_(\d{2,3})0$/);
+  if (metroMatch) {
+    const code = metroMatch[1];
+    // Enlever le zéro de padding si c'est un département à un chiffre (010 -> 01)
+    return code.replace(/^0+/, '') || '0';
+  }
 
   return '';
 }

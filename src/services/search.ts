@@ -185,12 +185,50 @@ function groupProprietesParAdresse(proprietes: Propriete[]): ProprieteGroupee[] 
   return Array.from(grouped.values());
 }
 
+// Normalise un nom de commune pour matcher la base de données
+// - Majuscules
+// - Supprime les accents
+// - Remplace les tirets par des espaces
+function normalizeCommune(nom: string): string {
+  return nom
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // Supprime les accents
+    .replace(/-/g, ' ')              // Remplace tirets par espaces
+    .replace(/\s+/g, ' ')            // Normalise les espaces
+    .trim();
+}
+
+// Récupère les noms de communes à partir d'un code postal via l'API geo.api.gouv.fr
+async function getCommunesFromCodePostal(codePostal: string): Promise<string[]> {
+  try {
+    const response = await fetch(`https://geo.api.gouv.fr/communes?codePostal=${codePostal}&fields=nom`);
+    if (!response.ok) return [];
+    const data = await response.json() as Array<{ nom: string }>;
+    // Normalise les noms pour matcher la base de données
+    return data.map(c => normalizeCommune(c.nom));
+  } catch (error) {
+    console.error('Erreur API geo.gouv.fr:', error);
+    return [];
+  }
+}
+
+// Convertit un numéro d'arrondissement en nom de commune selon la ville
+// Paris: "PARIS 09" (avec chiffres)
+// Lyon/Marseille: "LYON 1ER", "LYON 2EME", "MARSEILLE 1ER", "MARSEILLE 2EME"
+function getArrondissementName(ville: 'PARIS' | 'LYON' | 'MARSEILLE', numero: number): string {
+  if (ville === 'PARIS') {
+    return `PARIS ${numero.toString().padStart(2, '0')}`;
+  }
+  // Lyon et Marseille utilisent 1ER pour le premier, EME pour les autres
+  const suffix = numero === 1 ? '1ER' : `${numero}EME`;
+  return `${ville} ${suffix}`;
+}
+
 // Convertit un code postal en filtre commune
-// Pour Paris: 75009 -> "09" ou "9" pour matcher "PARIS 09"
-// Pour Lyon: 69001 -> "01" pour matcher "LYON 01"
-// Pour Marseille: 13001 -> "01" pour matcher "MARSEILLE 01"
-// Pour autres villes: utilise le nom de commune directement si fourni
-function codePostalToFilter(codePostal: string): { departement: string; communePattern?: string } {
+// Utilise l'API geo.api.gouv.fr pour récupérer le(s) nom(s) de commune(s)
+// Pour Paris/Lyon/Marseille: gère aussi le numéro d'arrondissement
+async function codePostalToFilter(codePostal: string): Promise<{ departement: string; communeNames?: string[] }> {
   const cp = codePostal.trim();
   if (cp.length !== 5) {
     return { departement: cp.substring(0, 2) };
@@ -198,15 +236,22 @@ function codePostalToFilter(codePostal: string): { departement: string; communeP
 
   const dept = cp.substring(0, 2);
   const suffix = cp.substring(2);
+  const arrondNum = parseInt(suffix, 10);
 
   // Paris (75), Lyon (69), Marseille (13) ont des arrondissements
-  if (dept === '75' || dept === '69' || dept === '13') {
-    // Enlever les zéros de tête pour le pattern (75009 -> 9 ou 09)
-    const arrond = parseInt(suffix, 10).toString().padStart(2, '0');
-    return { departement: dept, communePattern: arrond };
+  if (dept === '75' && arrondNum >= 1 && arrondNum <= 20) {
+    return { departement: dept, communeNames: [getArrondissementName('PARIS', arrondNum)] };
+  }
+  if (dept === '69' && arrondNum >= 1 && arrondNum <= 9) {
+    return { departement: dept, communeNames: [getArrondissementName('LYON', arrondNum)] };
+  }
+  if (dept === '13' && arrondNum >= 1 && arrondNum <= 16) {
+    return { departement: dept, communeNames: [getArrondissementName('MARSEILLE', arrondNum)] };
   }
 
-  return { departement: dept };
+  // Pour les autres villes: récupérer le nom de commune via l'API
+  const communeNames = await getCommunesFromCodePostal(cp);
+  return { departement: dept, communeNames: communeNames.length > 0 ? communeNames : undefined };
 }
 
 // Recherche par adresse
@@ -240,12 +285,12 @@ export async function searchByAddress(
 
   // Traitement du code postal
   let effectiveDepartement = departement;
-  let communePattern: string | undefined;
+  let communeNames: string[] | undefined;
 
   if (codePostal) {
-    const cpFilter = codePostalToFilter(codePostal);
+    const cpFilter = await codePostalToFilter(codePostal);
     effectiveDepartement = cpFilter.departement;
-    communePattern = cpFilter.communePattern;
+    communeNames = cpFilter.communeNames;
   }
 
   // Déterminer les tables à interroger
@@ -282,11 +327,12 @@ export async function searchByAddress(
       paramIndex++;
     }
 
-    if (communePattern) {
-      // Filtre sur nom_de_la_commune qui contient l'arrondissement (ex: "PARIS 09")
-      conditions.push(`nom_de_la_commune LIKE $${paramIndex}`);
-      params.push(`%${communePattern}%`);
-      paramIndex++;
+    // Filtre par nom(s) de commune (toutes les villes)
+    if (communeNames && communeNames.length > 0) {
+      const communePlaceholders = communeNames.map((_, i) => `$${paramIndex + i}`);
+      conditions.push(`UPPER(nom_de_la_commune) IN (${communePlaceholders.join(', ')})`);
+      params.push(...communeNames);
+      paramIndex += communeNames.length;
     }
 
     params.push(remainingLimit);
