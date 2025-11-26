@@ -33,6 +33,67 @@ function normalizeForSearch(str: string): string {
     .trim();
 }
 
+// Types de voie à filtrer (codes CNAVOI officiels + versions textuelles)
+const TYPES_VOIE = [
+  // Codes CNAVOI et leurs versions textuelles
+  'rue', 'rle', 'ruelle', 'ruet', 'ruellette', 'rult',
+  'avenue', 'av', 'pae', 'petite avenue',
+  'boulevard', 'bd', 'gbd', 'grand boulevard',
+  'impasse', 'imp',
+  'passage', 'pas', 'pass', 'passe',
+  'allee', 'all', 'pla', 'petite allee',
+  'place', 'pl', 'ptte', 'placette', 'plci', 'placis', 'gpl', 'grande place',
+  'square', 'sq',
+  'chemin', 'che', 'chem', 'cheminement', 'pch', 'petit chemin', 'vche', 'vieux chemin',
+  'cc', 'chemin communal', 'cd', 'chemin departemental', 'cr', 'chemin rural', 'cf', 'chemin forestier', 'chv', 'chemin vicinal',
+  'route', 'rte', 'prt', 'petite route', 'art', 'ancienne route', 'nte', 'nouvelle route', 'vte', 'vieille route',
+  'cours', 'crs',
+  'quai',
+  'voie', 'vc', 'voie communale', 'voir', 'voirie',
+  'villa', 'vla',
+  'cite',
+  'residence', 'res',
+  'sentier', 'sen', 'sente',
+  'traverse', 'tra',
+  'hameau', 'ham',
+  'lotissement', 'lot',
+  'zone', 'za', 'zac', 'zad', 'zi', 'zup',
+  'parc', 'pkg', 'parking',
+  'esplanade', 'esp',
+  'promenade', 'prom',
+  // Autres types courants
+  'gr', 'grande rue', 'ptr', 'petite rue',
+  'cour', 'galerie', 'gal', 'mail', 'terre', 'ter', 'tpl', 'terre plein',
+  'port', 'porte', 'pte', 'pont', 'quai', 'rampe', 'rpe',
+  'rond point', 'rpt', 'carrefour', 'car',
+  'montee', 'mte', 'descente', 'dsc',
+  'domaine', 'dom', 'ferme', 'frm', 'mas',
+  'jardin', 'jard', 'clos', 'enclos', 'enc',
+  'berge', 'ber', 'rive', 'bord',
+  'village', 'vge', 'quartier', 'qua', 'faubourg', 'fg', 'bourg', 'brg'
+];
+
+// Extrait le numéro de voirie et le reste de l'adresse (sans type de voie)
+function extractNumeroVoirie(adresse: string): { numero: string | null; reste: string } {
+  let normalized = adresse.trim();
+
+  // Extraire le numéro au début
+  let numero: string | null = null;
+  const matchNumero = normalized.match(/^(\d{1,4})\s*(bis|ter|b|t)?\s+(.+)$/i);
+  if (matchNumero) {
+    numero = matchNumero[1].padStart(4, '0'); // Format: 0005
+    normalized = matchNumero[3];
+  }
+
+  // Supprimer le type de voie s'il est au début
+  const words = normalized.toLowerCase().split(/\s+/);
+  if (words.length > 0 && TYPES_VOIE.includes(words[0])) {
+    words.shift(); // Enlever le premier mot (type de voie)
+  }
+
+  return { numero, reste: words.join(' ') };
+}
+
 // Transforme un enregistrement brut en Propriete formatée
 function transformToPropiete(raw: LocalRaw): Propriete {
   const adresse: Adresse = {
@@ -141,7 +202,11 @@ export async function searchByAddress(
   total_lots: number;
 }> {
   const maxResults = limit || config.search.maxLimit;
-  const normalizedSearch = normalizeForSearch(adresse);
+
+  // Extraire le numéro de voirie si présent
+  const { numero, reste } = extractNumeroVoirie(adresse);
+
+  const normalizedSearch = normalizeForSearch(reste);
   const searchTerms = normalizedSearch.split(' ').filter(t => t.length >= 2);
 
   if (searchTerms.length === 0) {
@@ -169,16 +234,31 @@ export async function searchByAddress(
 
     const remainingLimit = maxResults - results.length;
 
-    // Recherche fuzzy: ILIKE sur nom_voie normalisé
-    const query = `
-      SELECT *
-      FROM "${table}"
-      WHERE LOWER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $1
-      LIMIT $2
-    `;
+    // Recherche fuzzy: ILIKE sur nom_voie normalisé + filtre numéro si fourni
+    let query: string;
+    let params: (string | number)[];
+
+    if (numero) {
+      query = `
+        SELECT *
+        FROM "${table}"
+        WHERE LOWER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $1
+        AND "n°_voirie" = $2
+        LIMIT $3
+      `;
+      params = [searchPattern, numero, remainingLimit];
+    } else {
+      query = `
+        SELECT *
+        FROM "${table}"
+        WHERE LOWER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $1
+        LIMIT $2
+      `;
+      params = [searchPattern, remainingLimit];
+    }
 
     try {
-      const result = await pool.query(query, [searchPattern, remainingLimit]);
+      const result = await pool.query(query, params);
       results.push(...result.rows);
     } catch (error) {
       console.error(`Erreur lors de la recherche dans ${table}:`, error);
