@@ -44,27 +44,37 @@ export async function resolveTablesForDepartment(departement: string): Promise<s
   const tables = await fetchAvailableTables();
   const normalizedDept = normalizeDepartmentCode(departement);
 
+  console.log(`[table-resolver] departement=${departement}, normalized=${normalizedDept}, tables count=${tables.length}`);
+
   // Cas spécial Paris (75): tables pb_25_b_750_* et pm_25_b_750_*
   if (normalizedDept === '75') {
-    return tables.filter(t => t.startsWith('pb_25_b_750') || t.startsWith('pm_25_b_750'));
+    const matched = tables.filter(t => t.startsWith('pb_25_b_750') || t.startsWith('pm_25_b_750'));
+    console.log(`[table-resolver] Paris matched: ${matched.join(', ')}`);
+    return matched;
   }
 
   // DOM-TOM (971-976): pas de zéro final - pm_25_b_971, pm_25_b_972, etc.
   const deptNum = parseInt(normalizedDept);
   if (deptNum >= 971) {
     const pattern = `pm_25_b_${normalizedDept}`;
-    return tables.filter(t => t === pattern);
+    const matched = tables.filter(t => t === pattern);
+    console.log(`[table-resolver] DOM-TOM pattern=${pattern}, matched: ${matched.join(', ')}`);
+    return matched;
   }
 
   // Corse: pm_25_b_2a0, pm_25_b_2b0
   if (normalizedDept === '2A' || normalizedDept === '2B') {
     const pattern = `pm_25_b_${normalizedDept.toLowerCase()}0`;
-    return tables.filter(t => t === pattern);
+    const matched = tables.filter(t => t === pattern);
+    console.log(`[table-resolver] Corse pattern=${pattern}, matched: ${matched.join(', ')}`);
+    return matched;
   }
 
   // Départements métropolitains standards: pm_25_b_XXX0 (avec zéro final)
   const pattern = `pm_25_b_${normalizedDept}0`;
   const matching = tables.filter(t => t === pattern);
+
+  console.log(`[table-resolver] Metro pattern=${pattern}, matched: ${matching.join(', ')}, first 5 tables: ${tables.slice(0, 5).join(', ')}`);
 
   return matching;
 }
