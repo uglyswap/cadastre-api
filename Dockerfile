@@ -1,6 +1,9 @@
 # Build stage
 FROM node:20-alpine AS builder
 
+# Force rebuild with timestamp
+ARG CACHEBUST=1
+
 WORKDIR /app
 
 # Copier les fichiers de dépendances
@@ -25,7 +28,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Installer uniquement les dépendances de production
-RUN npm install --only=production && npm cache clean --force
+RUN npm install --omit=dev && npm cache clean --force
 
 # Copier le code compilé depuis le builder
 COPY --from=builder /app/dist ./dist
