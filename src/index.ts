@@ -72,14 +72,13 @@ async function start() {
   try {
     await setupServer();
 
-    // Vérifier la connexion à la base de données
+    // Vérifier la connexion à la base de données (ne pas crasher si échec)
     const dbConnected = await testConnection();
     if (!dbConnected) {
-      fastify.log.error('Impossible de se connecter à la base de données');
-      process.exit(1);
+      fastify.log.warn('ATTENTION: Impossible de se connecter à la base de données - les recherches ne fonctionneront pas');
+    } else {
+      fastify.log.info('Connexion à la base de données établie');
     }
-
-    fastify.log.info('Connexion à la base de données établie');
 
     // Démarrer le serveur
     await fastify.listen({
