@@ -185,11 +185,36 @@ function groupProprietesParAdresse(proprietes: Propriete[]): ProprieteGroupee[] 
   return Array.from(grouped.values());
 }
 
+// Convertit un code postal en filtre commune
+// Pour Paris: 75009 -> "09" ou "9" pour matcher "PARIS 09"
+// Pour Lyon: 69001 -> "01" pour matcher "LYON 01"
+// Pour Marseille: 13001 -> "01" pour matcher "MARSEILLE 01"
+// Pour autres villes: utilise le nom de commune directement si fourni
+function codePostalToFilter(codePostal: string): { departement: string; communePattern?: string } {
+  const cp = codePostal.trim();
+  if (cp.length !== 5) {
+    return { departement: cp.substring(0, 2) };
+  }
+
+  const dept = cp.substring(0, 2);
+  const suffix = cp.substring(2);
+
+  // Paris (75), Lyon (69), Marseille (13) ont des arrondissements
+  if (dept === '75' || dept === '69' || dept === '13') {
+    // Enlever les zéros de tête pour le pattern (75009 -> 9 ou 09)
+    const arrond = parseInt(suffix, 10).toString().padStart(2, '0');
+    return { departement: dept, communePattern: arrond };
+  }
+
+  return { departement: dept };
+}
+
 // Recherche par adresse
 export async function searchByAddress(
   adresse: string,
   departement?: string,
-  limit?: number
+  limit?: number,
+  codePostal?: string
 ): Promise<{
   resultats: Array<{
     proprietaire: Proprietaire;
@@ -213,10 +238,20 @@ export async function searchByAddress(
     return { resultats: [], total_proprietaires: 0, total_lots: 0 };
   }
 
+  // Traitement du code postal
+  let effectiveDepartement = departement;
+  let communePattern: string | undefined;
+
+  if (codePostal) {
+    const cpFilter = codePostalToFilter(codePostal);
+    effectiveDepartement = cpFilter.departement;
+    communePattern = cpFilter.communePattern;
+  }
+
   // Déterminer les tables à interroger
   let tables: string[];
-  if (departement) {
-    tables = await resolveTablesForDepartment(departement);
+  if (effectiveDepartement) {
+    tables = await resolveTablesForDepartment(effectiveDepartement);
   } else {
     tables = await resolveAllTables();
   }
@@ -234,28 +269,33 @@ export async function searchByAddress(
 
     const remainingLimit = maxResults - results.length;
 
-    // Recherche fuzzy: ILIKE sur nom_voie normalisé + filtre numéro si fourni
-    let query: string;
-    let params: (string | number)[];
+    // Construire la requête dynamiquement selon les filtres
+    const conditions: string[] = [
+      `LOWER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $1`
+    ];
+    const params: (string | number)[] = [searchPattern];
+    let paramIndex = 2;
 
     if (numero) {
-      query = `
-        SELECT *
-        FROM "${table}"
-        WHERE LOWER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $1
-        AND "n°_voirie" = $2
-        LIMIT $3
-      `;
-      params = [searchPattern, numero, remainingLimit];
-    } else {
-      query = `
-        SELECT *
-        FROM "${table}"
-        WHERE LOWER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $1
-        LIMIT $2
-      `;
-      params = [searchPattern, remainingLimit];
+      conditions.push(`"n°_voirie" = $${paramIndex}`);
+      params.push(numero);
+      paramIndex++;
     }
+
+    if (communePattern) {
+      // Filtre sur nom_de_la_commune qui contient l'arrondissement (ex: "PARIS 09")
+      conditions.push(`nom_de_la_commune LIKE $${paramIndex}`);
+      params.push(`%${communePattern}%`);
+      paramIndex++;
+    }
+
+    params.push(remainingLimit);
+    const query = `
+      SELECT *
+      FROM "${table}"
+      WHERE ${conditions.join(' AND ')}
+      LIMIT $${paramIndex}
+    `;
 
     try {
       const result = await pool.query(query, params);

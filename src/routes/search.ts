@@ -6,6 +6,7 @@ import { authHook } from '../middleware/auth.js';
 interface SearchByAddressQuery {
   adresse: string;
   departement?: string;
+  code_postal?: string;
   limit?: number;
 }
 
@@ -26,7 +27,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
     '/search/address',
     { ...authHook },
     async (request: FastifyRequest<{ Querystring: SearchByAddressQuery }>, reply: FastifyReply) => {
-      const { adresse, departement, limit } = request.query;
+      const { adresse, departement, code_postal, limit } = request.query;
 
       if (!adresse || adresse.trim().length < 3) {
         return reply.code(400).send({
@@ -38,13 +39,14 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       try {
-        const { resultats, total_proprietaires, total_lots } = await searchByAddress(adresse, departement, limit);
+        const { resultats, total_proprietaires, total_lots } = await searchByAddress(adresse, departement, limit, code_postal);
 
         return reply.send({
           success: true,
           query: {
             adresse,
             departement: departement || null,
+            code_postal: code_postal || null,
           },
           resultats: resultats.map(r => ({
             proprietaire: r.proprietaire,
