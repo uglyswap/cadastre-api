@@ -1,6 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { searchByAddress, searchBySiren, searchByDenomination } from '../services/search.js';
-import { searchByPolygon, getBanStats } from '../services/geo-search.js';
+import { searchByPolygon } from '../services/geo-search.js';
 import { authHook } from '../middleware/auth.js';
 
 // Types pour les requêtes
@@ -232,34 +232,6 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           error: 'Erreur interne du serveur',
           code: 'INTERNAL_ERROR',
           details: error instanceof Error ? error.message : 'Erreur inconnue',
-        });
-      }
-    }
-  );
-
-  // Route: Statistiques BAN (pour vérifier l'état de l'import)
-  fastify.get(
-    '/admin/ban/stats',
-    { ...authHook },
-    async (_request: FastifyRequest, reply: FastifyReply) => {
-      try {
-        const stats = await getBanStats();
-
-        return reply.send({
-          success: true,
-          ban: stats,
-          message: stats.postgis_installed
-            ? stats.total_adresses > 0
-              ? 'BAN importée et prête'
-              : 'PostGIS installé, BAN non importée. Exécutez scripts/import-ban.ts'
-            : 'PostGIS non installé. Exécutez scripts/setup-ban.sql',
-        });
-      } catch (error) {
-        console.error('Erreur stats BAN:', error);
-        return reply.code(500).send({
-          success: false,
-          error: 'Erreur lors de la récupération des stats',
-          code: 'INTERNAL_ERROR',
         });
       }
     }
