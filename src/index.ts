@@ -26,7 +26,7 @@ async function setupServer() {
   // CORS - permettre toutes les origines pour l'instant
   await fastify.register(cors, {
     origin: true,
-    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization'],
   });
 
@@ -89,6 +89,7 @@ async function start() {
     });
 
     fastify.log.info(`Serveur démarré sur http://${config.host}:${config.port}`);
+    fastify.log.info('Endpoints admin BAN: GET /admin/ban/status, POST /admin/ban/setup, POST /admin/ban/import');
   } catch (err) {
     fastify.log.error(err instanceof Error ? err.message : 'Erreur inconnue');
     process.exit(1);
