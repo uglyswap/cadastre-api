@@ -5,6 +5,7 @@ import { config } from './config/index.js';
 import { testConnection, closePool } from './services/database.js';
 import { searchRoutes } from './routes/search.js';
 import { healthRoutes } from './routes/health.js';
+import { adminRoutes } from './routes/admin.js';
 
 // Créer l'instance Fastify
 const fastify = Fastify({
@@ -25,7 +26,7 @@ async function setupServer() {
   // CORS - permettre toutes les origines pour l'instant
   await fastify.register(cors, {
     origin: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization'],
   });
 
@@ -44,6 +45,7 @@ async function setupServer() {
   // Enregistrer les routes
   await fastify.register(healthRoutes);
   await fastify.register(searchRoutes);
+  await fastify.register(adminRoutes);
 
   // Gestionnaire d'erreur global
   fastify.setErrorHandler((error: Error & { statusCode?: number }, _request, reply) => {
