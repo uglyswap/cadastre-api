@@ -1,6 +1,7 @@
 /**
  * Service de configuration automatique de la BAN
- * Gère l'installation de PostGIS, la création des tables et l'import des données
+ * Gère la création des tables et l'import des données
+ * Fonctionne avec ou sans PostGIS
  */
 
 import { pool } from './database.js';
@@ -82,61 +83,87 @@ export async function checkBanTable(): Promise<{ exists: boolean; count: number 
 }
 
 /**
- * Installe PostGIS et pg_trgm
+ * Essaie d'installer les extensions (optionnel, peut échouer)
  */
-export async function installExtensions(): Promise<{ success: boolean; message: string }> {
+export async function installExtensions(): Promise<{ success: boolean; message: string; postgis: boolean; pgtrgm: boolean }> {
   const results: string[] = [];
+  let postgisInstalled = false;
+  let pgtrgmInstalled = false;
   
+  // pg_trgm pour la recherche fuzzy (optionnel)
   try {
-    // PostGIS
-    try {
-      await pool.query('CREATE EXTENSION IF NOT EXISTS postgis');
-      results.push('PostGIS installé');
-    } catch (e: any) {
-      if (e.message.includes('permission denied')) {
-        return { success: false, message: 'Permission refusée pour installer PostGIS. Contactez l\'admin DB.' };
-      }
-      throw e;
-    }
-
-    // pg_trgm pour la recherche fuzzy
-    try {
-      await pool.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
-      results.push('pg_trgm installé');
-    } catch {
-      results.push('pg_trgm non disponible (optionnel)');
-    }
-
-    return { success: true, message: results.join(', ') };
-  } catch (error: any) {
-    return { success: false, message: error.message };
+    await pool.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+    results.push('pg_trgm installé');
+    pgtrgmInstalled = true;
+  } catch (e: any) {
+    results.push('pg_trgm non disponible (optionnel)');
   }
+
+  // PostGIS (optionnel - on peut travailler sans)
+  try {
+    await pool.query('CREATE EXTENSION IF NOT EXISTS postgis');
+    results.push('PostGIS installé');
+    postgisInstalled = true;
+  } catch (e: any) {
+    results.push('PostGIS non disponible (utilisation bbox + ray-casting)');
+  }
+
+  return { 
+    success: true, // Toujours succès car les extensions sont optionnelles
+    message: results.join(', '),
+    postgis: postgisInstalled,
+    pgtrgm: pgtrgmInstalled
+  };
 }
 
 /**
- * Crée la table BAN et les index
+ * Crée la table BAN et les index (fonctionne sans PostGIS)
  */
 export async function createBanTable(): Promise<{ success: boolean; message: string }> {
   try {
-    // Créer la table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ban_adresses (
-        id TEXT PRIMARY KEY,
-        numero TEXT,
-        rep TEXT,
-        nom_voie TEXT,
-        code_postal TEXT,
-        code_commune TEXT,
-        nom_commune TEXT,
-        lon DOUBLE PRECISION,
-        lat DOUBLE PRECISION,
-        geom GEOMETRY(Point, 4326),
-        nom_voie_normalized TEXT,
-        numero_formatted TEXT,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
+    // Vérifier si PostGIS est disponible
+    const postgis = await checkPostGIS();
+    
+    // Créer la table (avec ou sans colonne geometry)
+    if (postgis.installed) {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS ban_adresses (
+          id TEXT PRIMARY KEY,
+          numero TEXT,
+          rep TEXT,
+          nom_voie TEXT,
+          code_postal TEXT,
+          code_commune TEXT,
+          nom_commune TEXT,
+          lon DOUBLE PRECISION,
+          lat DOUBLE PRECISION,
+          geom GEOMETRY(Point, 4326),
+          nom_voie_normalized TEXT,
+          numero_formatted TEXT,
+          created_at TIMESTAMP DEFAULT NOW(),
+          updated_at TIMESTAMP DEFAULT NOW()
+        )
+      `);
+    } else {
+      // Version sans PostGIS - pas de colonne geom
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS ban_adresses (
+          id TEXT PRIMARY KEY,
+          numero TEXT,
+          rep TEXT,
+          nom_voie TEXT,
+          code_postal TEXT,
+          code_commune TEXT,
+          nom_commune TEXT,
+          lon DOUBLE PRECISION,
+          lat DOUBLE PRECISION,
+          nom_voie_normalized TEXT,
+          numero_formatted TEXT,
+          created_at TIMESTAMP DEFAULT NOW(),
+          updated_at TIMESTAMP DEFAULT NOW()
+        )
+      `);
+    }
 
     // Fonction de normalisation
     await pool.query(`
@@ -168,21 +195,35 @@ export async function createBanTable(): Promise<{ success: boolean; message: str
       $$ LANGUAGE plpgsql IMMUTABLE
     `);
 
-    // Trigger
-    await pool.query(`
-      CREATE OR REPLACE FUNCTION update_ban_normalized()
-      RETURNS TRIGGER AS $$
-      BEGIN
-        NEW.nom_voie_normalized := normalize_voie(NEW.nom_voie);
-        NEW.numero_formatted := format_numero(NEW.numero);
-        NEW.updated_at := NOW();
-        IF NEW.lon IS NOT NULL AND NEW.lat IS NOT NULL THEN
-          NEW.geom := ST_SetSRID(ST_MakePoint(NEW.lon, NEW.lat), 4326);
-        END IF;
-        RETURN NEW;
-      END;
-      $$ LANGUAGE plpgsql
-    `);
+    // Trigger adapté (avec ou sans PostGIS)
+    if (postgis.installed) {
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION update_ban_normalized()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          NEW.nom_voie_normalized := normalize_voie(NEW.nom_voie);
+          NEW.numero_formatted := format_numero(NEW.numero);
+          NEW.updated_at := NOW();
+          IF NEW.lon IS NOT NULL AND NEW.lat IS NOT NULL THEN
+            NEW.geom := ST_SetSRID(ST_MakePoint(NEW.lon, NEW.lat), 4326);
+          END IF;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+      `);
+    } else {
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION update_ban_normalized()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          NEW.nom_voie_normalized := normalize_voie(NEW.nom_voie);
+          NEW.numero_formatted := format_numero(NEW.numero);
+          NEW.updated_at := NOW();
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+      `);
+    }
 
     await pool.query('DROP TRIGGER IF EXISTS trg_ban_normalize ON ban_adresses');
     await pool.query(`
@@ -205,27 +246,51 @@ export async function createBanTable(): Promise<{ success: boolean; message: str
       )
     `);
 
-    return { success: true, message: 'Table BAN créée avec succès' };
+    return { 
+      success: true, 
+      message: postgis.installed 
+        ? 'Table BAN créée avec support PostGIS' 
+        : 'Table BAN créée (mode bbox sans PostGIS)'
+    };
   } catch (error: any) {
     return { success: false, message: error.message };
   }
 }
 
 /**
- * Crée les index spatiaux (après import)
+ * Crée les index (après import)
  */
 export async function createIndexes(): Promise<{ success: boolean; message: string }> {
   try {
-    await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_geom ON ban_adresses USING GIST(geom)');
+    const postgis = await checkPostGIS();
+    const pgtrgm = await checkPgTrgm();
+    
+    // Index sur lon/lat pour les requêtes bounding box
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_lon ON ban_adresses(lon)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_lat ON ban_adresses(lat)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_lon_lat ON ban_adresses(lon, lat)');
+    
     await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_code_postal ON ban_adresses(code_postal)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_code_commune ON ban_adresses(code_commune)');
     await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_numero ON ban_adresses(numero_formatted)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_nom_voie_norm ON ban_adresses(nom_voie_normalized)');
     
-    // Index trigram si disponible
-    try {
-      await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_nom_voie_trgm ON ban_adresses USING GIN(nom_voie_normalized gin_trgm_ops)');
-    } catch {
-      // pg_trgm non disponible
+    // Index spatial si PostGIS disponible
+    if (postgis.installed) {
+      try {
+        await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_geom ON ban_adresses USING GIST(geom)');
+      } catch {
+        // Ignore si échec
+      }
+    }
+    
+    // Index trigram si pg_trgm disponible
+    if (pgtrgm) {
+      try {
+        await pool.query('CREATE INDEX IF NOT EXISTS idx_ban_nom_voie_trgm ON ban_adresses USING GIN(nom_voie_normalized gin_trgm_ops)');
+      } catch {
+        // Ignore si échec
+      }
     }
 
     return { success: true, message: 'Index créés avec succès' };
@@ -494,12 +559,7 @@ export async function startBanImport(): Promise<{ success: boolean; message: str
     return { success: false, message: `Import déjà en cours (${importState.status})` };
   }
 
-  // Vérifier les prérequis
-  const postgis = await checkPostGIS();
-  if (!postgis.installed) {
-    return { success: false, message: 'PostGIS non installé. Appelez /admin/ban/setup d\'abord.' };
-  }
-
+  // Vérifier que la table existe
   const banTable = await checkBanTable();
   if (!banTable.exists) {
     return { success: false, message: 'Table BAN non créée. Appelez /admin/ban/setup d\'abord.' };
@@ -552,18 +612,15 @@ export async function startBanImport(): Promise<{ success: boolean; message: str
 }
 
 /**
- * Setup complet: extensions + table
+ * Setup complet: extensions (optionnelles) + table
  */
 export async function fullSetup(): Promise<{ success: boolean; steps: string[]; error?: string }> {
   const steps: string[] = [];
 
   try {
-    // 1. Extensions
+    // 1. Extensions (optionnelles - ne bloquent pas)
     const extResult = await installExtensions();
     steps.push(`Extensions: ${extResult.message}`);
-    if (!extResult.success) {
-      return { success: false, steps, error: extResult.message };
-    }
 
     // 2. Table BAN
     const tableResult = await createBanTable();
@@ -576,8 +633,8 @@ export async function fullSetup(): Promise<{ success: boolean; steps: string[]; 
     const postgis = await checkPostGIS();
     const banTable = await checkBanTable();
     
-    steps.push(`PostGIS: ${postgis.version || 'non installé'}`);
-    steps.push(`Table BAN: ${banTable.count} adresses`);
+    steps.push(`PostGIS: ${postgis.installed ? postgis.version : 'non disponible (utilisation bbox)'}`);
+    steps.push(`Table BAN: prête (${banTable.count} adresses)`);
 
     return { success: true, steps };
   } catch (error: any) {
