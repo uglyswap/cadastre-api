@@ -36,6 +36,8 @@ export interface Adresse {
   commune: string;
   departement: string;
   adresse_complete: string;
+  latitude?: number;
+  longitude?: number;
 }
 
 export interface ReferenceCadastrale {
@@ -160,6 +162,41 @@ export interface SearchByOwnerResponse {
   nombre_adresses: number;
   nombre_lots: number;
   departements_concernes: string[];
+}
+
+// Types pour la recherche géographique
+export interface GeoSearchQuery {
+  polygon: number[][]; // Coordonnées [lng, lat][]
+  limit?: number;
+}
+
+export interface GeoSearchResponse {
+  success: boolean;
+  query: {
+    polygon_points: number;
+    limit: number;
+  };
+  resultats: Array<{
+    proprietaire: Proprietaire;
+    entreprise?: EntrepriseEnrichie;
+    proprietes: ProprieteGroupee[];
+    nombre_adresses: number;
+    nombre_lots: number;
+    coordonnees?: { lat: number; lon: number };
+  }>;
+  total_proprietaires: number;
+  total_lots: number;
+  stats: {
+    adresses_ban_trouvees: number;
+    adresses_matchees: number;
+  };
+}
+
+export interface BanStats {
+  total_adresses: number;
+  adresses_geolocalisees: number;
+  derniere_maj: string | null;
+  postgis_installed: boolean;
 }
 
 // Types pour l'authentification

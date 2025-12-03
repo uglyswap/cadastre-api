@@ -1,5 +1,6 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { searchByAddress, searchBySiren, searchByDenomination } from '../services/search.js';
+import { searchByPolygon, getBanStats } from '../services/geo-search.js';
 import { authHook } from '../middleware/auth.js';
 
 // Types pour les requêtes
@@ -18,6 +19,11 @@ interface SearchBySirenQuery {
 interface SearchByDenominationQuery {
   denomination: string;
   departement?: string;
+  limit?: number;
+}
+
+interface SearchByPolygonBody {
+  polygon: number[][];
   limit?: number;
 }
 
@@ -157,6 +163,103 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           error: 'Erreur interne du serveur',
           code: 'INTERNAL_ERROR',
           details: error instanceof Error ? error.message : 'Erreur inconnue',
+        });
+      }
+    }
+  );
+
+  // Route: Recherche par zone géographique (polygone)
+  fastify.post<{ Body: SearchByPolygonBody }>(
+    '/search/geo',
+    { ...authHook },
+    async (request: FastifyRequest<{ Body: SearchByPolygonBody }>, reply: FastifyReply) => {
+      const { polygon, limit } = request.body;
+
+      // Validation du polygone
+      if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
+        return reply.code(400).send({
+          success: false,
+          error: 'Polygone invalide',
+          code: 'INVALID_POLYGON',
+          details: 'Le polygone doit contenir au moins 3 points [[lng, lat], ...]',
+        });
+      }
+
+      // Vérifier que chaque point a 2 coordonnées
+      for (const point of polygon) {
+        if (!Array.isArray(point) || point.length !== 2 ||
+            typeof point[0] !== 'number' || typeof point[1] !== 'number') {
+          return reply.code(400).send({
+            success: false,
+            error: 'Format de coordonnées invalide',
+            code: 'INVALID_COORDINATES',
+            details: 'Chaque point doit être au format [longitude, latitude] (nombres)',
+          });
+        }
+      }
+
+      // Limiter la taille du polygone
+      if (polygon.length > 100) {
+        return reply.code(400).send({
+          success: false,
+          error: 'Polygone trop complexe',
+          code: 'POLYGON_TOO_COMPLEX',
+          details: 'Le polygone ne doit pas dépasser 100 points',
+        });
+      }
+
+      try {
+        const result = await searchByPolygon(polygon, limit || 100);
+
+        return reply.send({
+          success: true,
+          query: {
+            polygon_points: polygon.length,
+            limit: limit || 100,
+          },
+          resultats: result.resultats,
+          total_proprietaires: result.total_proprietaires,
+          total_lots: result.total_lots,
+          stats: {
+            adresses_ban_trouvees: result.adresses_ban_trouvees,
+            adresses_matchees: result.adresses_matchees,
+          },
+        });
+      } catch (error) {
+        console.error('Erreur recherche géographique:', error);
+        return reply.code(500).send({
+          success: false,
+          error: 'Erreur interne du serveur',
+          code: 'INTERNAL_ERROR',
+          details: error instanceof Error ? error.message : 'Erreur inconnue',
+        });
+      }
+    }
+  );
+
+  // Route: Statistiques BAN (pour vérifier l'état de l'import)
+  fastify.get(
+    '/admin/ban/stats',
+    { ...authHook },
+    async (_request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const stats = await getBanStats();
+
+        return reply.send({
+          success: true,
+          ban: stats,
+          message: stats.postgis_installed
+            ? stats.total_adresses > 0
+              ? 'BAN importée et prête'
+              : 'PostGIS installé, BAN non importée. Exécutez scripts/import-ban.ts'
+            : 'PostGIS non installé. Exécutez scripts/setup-ban.sql',
+        });
+      } catch (error) {
+        console.error('Erreur stats BAN:', error);
+        return reply.code(500).send({
+          success: false,
+          error: 'Erreur lors de la récupération des stats',
+          code: 'INTERNAL_ERROR',
         });
       }
     }
