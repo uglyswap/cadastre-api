@@ -209,13 +209,13 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       try {
-        const result = await searchByPolygon(polygon, limit || 100);
+        const result = await searchByPolygon(polygon, limit || 500);
 
         return reply.send({
           success: true,
           query: {
             polygon_points: polygon.length,
-            limit: limit || 100,
+            limit: limit || 500,
           },
           resultats: result.resultats,
           total_proprietaires: result.total_proprietaires,
