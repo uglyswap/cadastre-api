@@ -3,6 +3,8 @@ import { searchByAddress, searchBySiren, searchByDenomination } from '../service
 import { searchByPolygon } from '../services/geo-search.js';
 import { authHook } from '../middleware/auth.js';
 
+// BUILD v1.1.0 - 2025-12-04T05:15:00Z - Force rebuild
+
 // Types pour les requêtes
 interface SearchByAddressQuery {
   adresse: string;
@@ -238,8 +240,8 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           }
         };
 
-        // Envoyer un heartbeat initial immédiatement
-        writeAndFlush(JSON.stringify({ type: 'start', message: 'Recherche géographique démarrée', timestamp: new Date().toISOString() }) + '\n');
+        // Envoyer un heartbeat initial immédiatement avec BUILD marker
+        writeAndFlush(JSON.stringify({ type: 'start', message: 'Recherche géographique démarrée', build: 'v1.1.0', timestamp: new Date().toISOString() }) + '\n');
 
         // Setup heartbeat interval to keep connection alive
         let heartbeatCount = 0;
