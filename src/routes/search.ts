@@ -173,13 +173,9 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
   // Utilise NDJSON streaming pour éviter les timeouts sur les grandes zones
   fastify.post<{ Body: SearchByPolygonBody }>(
     '/search/geo',
-    {
-      ...authHook,
-      config: {
-        requestTimeout: 300000,
-      },
-    },
+    { ...authHook },
     async (request: FastifyRequest<{ Body: SearchByPolygonBody }>, reply: FastifyReply) => {
+      // Set timeout on raw socket for long-running requests
       request.raw.setTimeout(300000);
       
       const { polygon, limit, stream } = request.body;
