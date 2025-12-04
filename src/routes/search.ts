@@ -209,13 +209,15 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       try {
-        const result = await searchByPolygon(polygon, limit || 500);
+        // Si pas de limit spécifié, pas de limite (10000 max pour éviter les abus)
+        const effectiveLimit = limit || 10000;
+        const result = await searchByPolygon(polygon, effectiveLimit);
 
         return reply.send({
           success: true,
           query: {
             polygon_points: polygon.length,
-            limit: limit || 500,
+            limit: limit || 'illimité',
           },
           resultats: result.resultats,
           total_proprietaires: result.total_proprietaires,
