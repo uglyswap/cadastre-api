@@ -25,6 +25,7 @@ interface SearchByDenominationQuery {
 interface SearchByPolygonBody {
   polygon: number[][];
   limit?: number;
+  stream?: boolean;
 }
 
 export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
@@ -169,21 +170,19 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
   );
 
   // Route: Recherche par zone géographique (polygone)
-  // Timeout étendu à 5 minutes pour les grandes zones
+  // Utilise NDJSON streaming pour éviter les timeouts sur les grandes zones
   fastify.post<{ Body: SearchByPolygonBody }>(
     '/search/geo',
     {
       ...authHook,
       config: {
-        // 5 minutes timeout pour les grandes recherches géographiques
         requestTimeout: 300000,
       },
     },
     async (request: FastifyRequest<{ Body: SearchByPolygonBody }>, reply: FastifyReply) => {
-      // Définir le timeout de la connexion
       request.raw.setTimeout(300000);
       
-      const { polygon, limit } = request.body;
+      const { polygon, limit, stream } = request.body;
 
       // Validation du polygone
       if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
@@ -218,9 +217,58 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         });
       }
 
+      const effectiveLimit = limit || 10000;
+
+      // Mode streaming NDJSON pour les grandes requêtes
+      if (stream) {
+        reply.raw.writeHead(200, {
+          'Content-Type': 'application/x-ndjson',
+          'Transfer-Encoding': 'chunked',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        });
+
+        // Envoyer un heartbeat initial
+        reply.raw.write(JSON.stringify({ type: 'start', message: 'Recherche géographique démarrée' }) + '\n');
+
+        try {
+          const result = await searchByPolygon(polygon, effectiveLimit);
+
+          // Envoyer le résultat final
+          reply.raw.write(JSON.stringify({
+            type: 'result',
+            success: true,
+            query: {
+              polygon_points: polygon.length,
+              limit: limit || 'illimité',
+            },
+            resultats: result.resultats,
+            total_proprietaires: result.total_proprietaires,
+            total_lots: result.total_lots,
+            stats: {
+              adresses_ban_trouvees: result.adresses_ban_trouvees,
+              adresses_matchees: result.adresses_matchees,
+            },
+            limites_appliquees: result.limites_appliquees,
+          }) + '\n');
+
+          reply.raw.end();
+        } catch (error) {
+          console.error('Erreur recherche géographique (stream):', error);
+          reply.raw.write(JSON.stringify({
+            type: 'error',
+            success: false,
+            error: 'Erreur interne du serveur',
+            code: 'INTERNAL_ERROR',
+            details: error instanceof Error ? error.message : 'Erreur inconnue',
+          }) + '\n');
+          reply.raw.end();
+        }
+        return;
+      }
+
+      // Mode standard (non-streaming)
       try {
-        // Si pas de limit spécifié, pas de limite (10000 max pour éviter les abus)
-        const effectiveLimit = limit || 10000;
         const result = await searchByPolygon(polygon, effectiveLimit);
 
         return reply.send({
@@ -229,13 +277,15 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
             polygon_points: polygon.length,
             limit: limit || 'illimité',
           },
-          resultats: result.resultats,
+          count: result.total_proprietaires,
+          proprietaires: result.resultats,
           total_proprietaires: result.total_proprietaires,
           total_lots: result.total_lots,
           stats: {
             adresses_ban_trouvees: result.adresses_ban_trouvees,
             adresses_matchees: result.adresses_matchees,
           },
+          limites_appliquees: result.limites_appliquees,
         });
       } catch (error) {
         console.error('Erreur recherche géographique:', error);
