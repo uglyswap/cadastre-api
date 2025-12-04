@@ -7,7 +7,7 @@ import { searchRoutes } from './routes/search.js';
 import { healthRoutes } from './routes/health.js';
 import { adminRoutes } from './routes/admin.js';
 
-// Créer l'instance Fastify
+// Créer l'instance Fastify avec timeout étendu pour les recherches géo
 const fastify = Fastify({
   logger: {
     level: 'info',
@@ -19,6 +19,10 @@ const fastify = Fastify({
       },
     },
   },
+  // Timeout de 5 minutes pour les grandes recherches géographiques
+  requestTimeout: 300000,
+  connectionTimeout: 300000,
+  keepAliveTimeout: 300000,
 });
 
 // Configuration
@@ -89,6 +93,7 @@ async function start() {
     });
 
     fastify.log.info(`Serveur démarré sur http://${config.host}:${config.port}`);
+    fastify.log.info('Timeout configuré: 5 minutes pour les recherches géographiques');
     fastify.log.info('Endpoints admin BAN: GET /admin/ban/status, POST /admin/ban/setup, POST /admin/ban/import');
   } catch (err) {
     fastify.log.error(err instanceof Error ? err.message : 'Erreur inconnue');
