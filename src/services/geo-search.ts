@@ -1,11 +1,11 @@
 /**
  * Service de recherche géographique
- * Utilise la BAN (Base Adresse Nationale) avec PostGIS
+ * Utilise l'API externe BAN (api-adresse.data.gouv.fr)
  * pour trouver les propriétaires dans un polygone
  */
 
 import { pool } from './database.js';
-import { resolveAllTables, resolveTablesForDepartment } from '../utils/table-resolver.js';
+import { resolveTablesForDepartment } from '../utils/table-resolver.js';
 import { enrichSiren } from './entreprises-api.js';
 import {
   LocalRaw,
@@ -25,16 +25,153 @@ import {
   normalizeNomVoie,
 } from '../utils/abbreviations.js';
 
-// Convertit un polygone [[lng, lat], ...] en WKT
-function polygonToWKT(polygon: number[][]): string {
-  const coords = [...polygon];
-  // Fermer le polygone si nécessaire
-  if (coords[0][0] !== coords[coords.length - 1][0] || 
-      coords[0][1] !== coords[coords.length - 1][1]) {
-    coords.push(coords[0]);
+// Interface pour les réponses de l'API BAN
+interface BanReverseResponse {
+  type: string;
+  version: string;
+  features: Array<{
+    type: string;
+    geometry: {
+      type: string;
+      coordinates: [number, number];
+    };
+    properties: {
+      label: string;
+      score: number;
+      housenumber?: string;
+      id: string;
+      name: string;
+      postcode: string;
+      citycode: string;
+      x: number;
+      y: number;
+      city: string;
+      context: string;
+      type: string;
+      importance: number;
+      street?: string;
+    };
+  }>;
+}
+
+// Interface pour les adresses normalisées
+interface NormalizedAddress {
+  id: string;
+  numero: string;
+  nom_voie: string;
+  nom_voie_normalized: string;
+  code_postal: string;
+  code_commune: string;
+  nom_commune: string;
+  departement: string;
+  lon: number;
+  lat: number;
+}
+
+// Délai entre les appels API (en ms) pour respecter les limites
+const API_RATE_LIMIT_DELAY = 100;
+
+// Fonction pour attendre
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Vérifie si un point est dans un polygone (ray casting algorithm)
+function pointInPolygon(point: [number, number], polygon: number[][]): boolean {
+  const [x, y] = point;
+  let inside = false;
+
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i];
+    const [xj, yj] = polygon[j];
+
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
   }
-  const coordsStr = coords.map(p => `${p[0]} ${p[1]}`).join(', ');
-  return `POLYGON((${coordsStr}))`;
+
+  return inside;
+}
+
+// Calcule le bounding box d'un polygone
+function getBoundingBox(polygon: number[][]): { minLon: number; maxLon: number; minLat: number; maxLat: number } {
+  let minLon = Infinity, maxLon = -Infinity;
+  let minLat = Infinity, maxLat = -Infinity;
+
+  for (const [lon, lat] of polygon) {
+    minLon = Math.min(minLon, lon);
+    maxLon = Math.max(maxLon, lon);
+    minLat = Math.min(minLat, lat);
+    maxLat = Math.max(maxLat, lat);
+  }
+
+  return { minLon, maxLon, minLat, maxLat };
+}
+
+// Génère une grille de points à l'intérieur du polygone
+function generateGridPoints(polygon: number[][], gridSize: number = 10): Array<[number, number]> {
+  const { minLon, maxLon, minLat, maxLat } = getBoundingBox(polygon);
+  const points: Array<[number, number]> = [];
+
+  const lonStep = (maxLon - minLon) / gridSize;
+  const latStep = (maxLat - minLat) / gridSize;
+
+  for (let i = 0; i <= gridSize; i++) {
+    for (let j = 0; j <= gridSize; j++) {
+      const lon = minLon + (lonStep * i);
+      const lat = minLat + (latStep * j);
+      const point: [number, number] = [lon, lat];
+
+      if (pointInPolygon(point, polygon)) {
+        points.push(point);
+      }
+    }
+  }
+
+  // Ajouter le centroïde
+  const centroidLon = (minLon + maxLon) / 2;
+  const centroidLat = (minLat + maxLat) / 2;
+  if (pointInPolygon([centroidLon, centroidLat], polygon)) {
+    points.push([centroidLon, centroidLat]);
+  }
+
+  return points;
+}
+
+// Appelle l'API BAN reverse pour un point
+async function reverseGeocode(lon: number, lat: number): Promise<NormalizedAddress[]> {
+  try {
+    const url = `https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}&limit=5`;
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      console.warn(`[geo-search] API BAN erreur ${response.status} pour ${lon},${lat}`);
+      return [];
+    }
+
+    const data: BanReverseResponse = await response.json();
+
+    return data.features.map(feature => {
+      const props = feature.properties;
+      const dept = props.postcode?.substring(0, 2) || '';
+
+      return {
+        id: props.id,
+        numero: props.housenumber || '',
+        nom_voie: props.street || props.name || '',
+        nom_voie_normalized: normalizeVoieForMatching(props.street || props.name || ''),
+        code_postal: props.postcode || '',
+        code_commune: props.citycode || '',
+        nom_commune: props.city || '',
+        departement: dept,
+        lon: feature.geometry.coordinates[0],
+        lat: feature.geometry.coordinates[1],
+      };
+    });
+  } catch (error) {
+    console.warn(`[geo-search] Erreur API BAN pour ${lon},${lat}:`, error);
+    return [];
+  }
 }
 
 // Normalise un nom de voie pour le matching
@@ -61,74 +198,62 @@ function normalizeCommuneForMatching(commune: string): string {
     .trim();
 }
 
-// Récupère les adresses BAN dans un polygone
+// Récupère les adresses BAN dans un polygone via l'API externe
 async function getBanAddressesInPolygon(
-  polygonWKT: string,
+  polygon: number[][],
   limit: number = 500
-): Promise<Array<{
-  id: string;
-  numero: string;
-  rep: string;
-  nom_voie: string;
-  nom_voie_normalized: string;
-  code_postal: string;
-  code_commune: string;
-  nom_commune: string;
-  departement: string;
-  lon: number;
-  lat: number;
-}>> {
-  const query = `
-    SELECT 
-      id,
-      numero,
-      rep,
-      nom_voie,
-      nom_voie_normalized,
-      code_postal,
-      code_commune,
-      nom_commune,
-      SUBSTRING(code_postal FROM 1 FOR 2) as departement,
-      lon,
-      lat
-    FROM ban_adresses
-    WHERE geom IS NOT NULL
-      AND ST_Contains(
-        ST_GeomFromText($1, 4326),
-        geom
-      )
-    LIMIT $2
-  `;
+): Promise<NormalizedAddress[]> {
+  console.log(`[geo-search] Génération de la grille de points...`);
 
-  try {
-    const result = await pool.query(query, [polygonWKT, limit]);
-    return result.rows;
-  } catch (error: any) {
-    // Si PostGIS n'est pas disponible, retourner une erreur claire
-    if (error.code === '42883' || error.message?.includes('st_contains')) {
-      throw new Error('PostGIS non installé. Exécutez scripts/setup-ban.sql');
+  // Calculer la taille de grille en fonction de la surface du polygone
+  const { minLon, maxLon, minLat, maxLat } = getBoundingBox(polygon);
+  const width = maxLon - minLon;
+  const height = maxLat - minLat;
+
+  // Plus le polygone est grand, plus la grille est dense
+  const gridSize = Math.min(15, Math.max(5, Math.ceil(Math.sqrt(width * height) * 100)));
+
+  const gridPoints = generateGridPoints(polygon, gridSize);
+  console.log(`[geo-search] ${gridPoints.length} points de grille générés`);
+
+  // Limiter le nombre de points pour ne pas surcharger l'API
+  const maxPoints = Math.min(50, gridPoints.length);
+  const selectedPoints = gridPoints.slice(0, maxPoints);
+
+  const allAddresses: NormalizedAddress[] = [];
+  const seenIds = new Set<string>();
+
+  console.log(`[geo-search] Interrogation de l'API BAN pour ${selectedPoints.length} points...`);
+
+  for (const [lon, lat] of selectedPoints) {
+    if (allAddresses.length >= limit) break;
+
+    const addresses = await reverseGeocode(lon, lat);
+
+    for (const addr of addresses) {
+      if (!seenIds.has(addr.id)) {
+        seenIds.add(addr.id);
+        allAddresses.push(addr);
+      }
     }
-    throw error;
+
+    // Rate limiting
+    await sleep(API_RATE_LIMIT_DELAY);
   }
+
+  console.log(`[geo-search] ${allAddresses.length} adresses uniques trouvées via API BAN`);
+  return allAddresses;
 }
 
 // Trouve les propriétaires MAJIC correspondant aux adresses BAN
 async function findMajicProprietaires(
-  banAddresses: Array<{
-    numero: string;
-    nom_voie: string;
-    nom_voie_normalized: string;
-    nom_commune: string;
-    departement: string;
-    lon: number;
-    lat: number;
-  }>,
+  banAddresses: NormalizedAddress[],
   limit: number = 200
 ): Promise<Array<LocalRaw & { ban_lon: number; ban_lat: number }>> {
   if (banAddresses.length === 0) return [];
 
   // Grouper par département pour optimiser les requêtes
-  const byDepartement = new Map<string, typeof banAddresses>();
+  const byDepartement = new Map<string, NormalizedAddress[]>();
   for (const addr of banAddresses) {
     const dept = addr.departement;
     if (!byDepartement.has(dept)) {
@@ -149,7 +274,7 @@ async function findMajicProprietaires(
       if (results.length >= limit) break;
 
       // Construire une requête avec matching fuzzy
-      for (const addr of addresses.slice(0, 50)) { // Limiter par adresse pour éviter les requêtes trop longues
+      for (const addr of addresses.slice(0, 50)) {
         if (results.length >= limit) break;
 
         const numeroFormatted = addr.numero ? addr.numero.padStart(4, '0') : null;
@@ -172,14 +297,11 @@ async function findMajicProprietaires(
           paramIndex++;
         }
 
-        // Matching par nom de voie (fuzzy avec similarité)
+        // Matching par nom de voie (fuzzy)
         if (voieNormalized.length >= 3) {
-          query += ` AND (
-            UPPER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $${paramIndex}
-            OR SIMILARITY(UPPER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')), $${paramIndex + 1}) > 0.3
-          )`;
-          params.push(`%${voieNormalized}%`, voieNormalized);
-          paramIndex += 2;
+          query += ` AND UPPER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $${paramIndex}`;
+          params.push(`%${voieNormalized}%`);
+          paramIndex++;
         }
 
         // Matching par commune
@@ -196,26 +318,8 @@ async function findMajicProprietaires(
           const result = await pool.query(query, params);
           results.push(...result.rows);
         } catch (error) {
-          // Ignorer les erreurs de similarité si pg_trgm n'est pas installé
-          // et réessayer sans similarité
-          try {
-            const simpleQuery = `
-              SELECT *, $1::float as ban_lon, $2::float as ban_lat
-              FROM "${table}"
-              WHERE "n°_voirie" = $3
-                AND UPPER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $4
-              LIMIT 5
-            `;
-            const simpleResult = await pool.query(simpleQuery, [
-              addr.lon,
-              addr.lat,
-              numeroFormatted || '',
-              `%${voieNormalized}%`
-            ]);
-            results.push(...simpleResult.rows);
-          } catch {
-            // Ignorer silencieusement
-          }
+          // Ignorer les erreurs et continuer
+          console.warn(`[geo-search] Erreur requête MAJIC:`, error);
         }
       }
     }
@@ -321,6 +425,7 @@ function groupProprietesParAdresse(proprietes: any[]): ProprieteGroupee[] {
 
 /**
  * Recherche les propriétaires dans un polygone géographique
+ * Utilise l'API externe BAN (api-adresse.data.gouv.fr)
  */
 export async function searchByPolygon(
   polygon: number[][],
@@ -341,11 +446,8 @@ export async function searchByPolygon(
 }> {
   console.log(`[geo-search] Recherche dans polygone (${polygon.length} points), limit=${limit}`);
 
-  // 1. Convertir le polygone en WKT
-  const polygonWKT = polygonToWKT(polygon);
-
-  // 2. Récupérer les adresses BAN dans le polygone
-  const banAddresses = await getBanAddressesInPolygon(polygonWKT, limit * 5);
+  // 1. Récupérer les adresses via API BAN externe
+  const banAddresses = await getBanAddressesInPolygon(polygon, limit * 5);
   console.log(`[geo-search] ${banAddresses.length} adresses BAN trouvées`);
 
   if (banAddresses.length === 0) {
@@ -358,11 +460,11 @@ export async function searchByPolygon(
     };
   }
 
-  // 3. Matcher avec les propriétaires MAJIC
+  // 2. Matcher avec les propriétaires MAJIC
   const majicResults = await findMajicProprietaires(banAddresses, limit * 3);
   console.log(`[geo-search] ${majicResults.length} propriétés MAJIC matchées`);
 
-  // 4. Grouper par propriétaire
+  // 3. Grouper par propriétaire
   const proprietairesMap = new Map<string, {
     proprietaire: Proprietaire;
     proprietes: any[];
@@ -388,7 +490,7 @@ export async function searchByPolygon(
     if (raw['n°_siren']) entry.sirens.add(raw['n°_siren']);
   }
 
-  // 5. Enrichir avec API Entreprises et construire les résultats
+  // 4. Enrichir avec API Entreprises et construire les résultats
   const resultats: Array<{
     proprietaire: Proprietaire;
     proprietes: ProprieteGroupee[];
@@ -438,54 +540,21 @@ export async function searchByPolygon(
 }
 
 /**
- * Retourne les statistiques de la table BAN
+ * Retourne les statistiques de la recherche géo
+ * Plus besoin de table BAN locale
  */
 export async function getBanStats(): Promise<{
   total_adresses: number;
   adresses_geolocalisees: number;
   derniere_maj: string | null;
   postgis_installed: boolean;
+  mode: string;
 }> {
-  try {
-    // Vérifier PostGIS
-    let postgisInstalled = false;
-    try {
-      await pool.query('SELECT PostGIS_Version()');
-      postgisInstalled = true;
-    } catch {
-      postgisInstalled = false;
-    }
-
-    // Compter les adresses
-    let totalAdresses = 0;
-    let adressesGeo = 0;
-    let derniereMaj: string | null = null;
-
-    try {
-      const countResult = await pool.query('SELECT COUNT(*) FROM ban_adresses');
-      totalAdresses = parseInt(countResult.rows[0].count) || 0;
-
-      const geoResult = await pool.query('SELECT COUNT(*) FROM ban_adresses WHERE geom IS NOT NULL');
-      adressesGeo = parseInt(geoResult.rows[0].count) || 0;
-
-      const majResult = await pool.query('SELECT MAX(updated_at) as last_update FROM ban_adresses');
-      derniereMaj = majResult.rows[0]?.last_update || null;
-    } catch {
-      // Table n'existe pas encore
-    }
-
-    return {
-      total_adresses: totalAdresses,
-      adresses_geolocalisees: adressesGeo,
-      derniere_maj: derniereMaj,
-      postgis_installed: postgisInstalled,
-    };
-  } catch (error) {
-    return {
-      total_adresses: 0,
-      adresses_geolocalisees: 0,
-      derniere_maj: null,
-      postgis_installed: false,
-    };
-  }
+  return {
+    total_adresses: 0,
+    adresses_geolocalisees: 0,
+    derniere_maj: null,
+    postgis_installed: false,
+    mode: 'api_externe',
+  };
 }
