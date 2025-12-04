@@ -69,7 +69,7 @@ interface NormalizedAddress {
 }
 
 // Délai entre les appels API (en ms) pour respecter les limites
-const API_RATE_LIMIT_DELAY = 100;
+const API_RATE_LIMIT_DELAY = 50;
 
 // Fonction pour attendre
 function sleep(ms: number): Promise<void> {
@@ -141,7 +141,7 @@ function generateGridPoints(polygon: number[][], gridSize: number = 10): Array<[
 // Appelle l'API BAN reverse pour un point
 async function reverseGeocode(lon: number, lat: number): Promise<NormalizedAddress[]> {
   try {
-    const url = `https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}&limit=5`;
+    const url = `https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}&limit=10`;
     const response = await fetch(url);
 
     if (!response.ok) {
@@ -201,7 +201,7 @@ function normalizeCommuneForMatching(commune: string): string {
 // Récupère les adresses BAN dans un polygone via l'API externe
 async function getBanAddressesInPolygon(
   polygon: number[][],
-  limit: number = 500
+  limit: number = 10000
 ): Promise<NormalizedAddress[]> {
   console.log(`[geo-search] Génération de la grille de points...`);
 
@@ -210,14 +210,14 @@ async function getBanAddressesInPolygon(
   const width = maxLon - minLon;
   const height = maxLat - minLat;
 
-  // Plus le polygone est grand, plus la grille est dense
-  const gridSize = Math.min(15, Math.max(5, Math.ceil(Math.sqrt(width * height) * 100)));
+  // Plus le polygone est grand, plus la grille est dense (jusqu'à 25x25 = 625 points)
+  const gridSize = Math.min(25, Math.max(5, Math.ceil(Math.sqrt(width * height) * 150)));
 
   const gridPoints = generateGridPoints(polygon, gridSize);
   console.log(`[geo-search] ${gridPoints.length} points de grille générés`);
 
-  // Limiter le nombre de points pour ne pas surcharger l'API
-  const maxPoints = Math.min(50, gridPoints.length);
+  // Plus de limite stricte sur les points - on prend tout
+  const maxPoints = Math.min(200, gridPoints.length);
   const selectedPoints = gridPoints.slice(0, maxPoints);
 
   const allAddresses: NormalizedAddress[] = [];
@@ -226,8 +226,6 @@ async function getBanAddressesInPolygon(
   console.log(`[geo-search] Interrogation de l'API BAN pour ${selectedPoints.length} points...`);
 
   for (const [lon, lat] of selectedPoints) {
-    if (allAddresses.length >= limit) break;
-
     const addresses = await reverseGeocode(lon, lat);
 
     for (const addr of addresses) {
@@ -237,7 +235,7 @@ async function getBanAddressesInPolygon(
       }
     }
 
-    // Rate limiting
+    // Rate limiting plus léger
     await sleep(API_RATE_LIMIT_DELAY);
   }
 
@@ -248,7 +246,7 @@ async function getBanAddressesInPolygon(
 // Trouve les propriétaires MAJIC correspondant aux adresses BAN
 async function findMajicProprietaires(
   banAddresses: NormalizedAddress[],
-  limit: number = 200
+  limit: number = 10000
 ): Promise<Array<LocalRaw & { ban_lon: number; ban_lat: number }>> {
   if (banAddresses.length === 0) return [];
 
@@ -273,8 +271,8 @@ async function findMajicProprietaires(
     for (const table of tables) {
       if (results.length >= limit) break;
 
-      // Construire une requête avec matching fuzzy
-      for (const addr of addresses.slice(0, 50)) {
+      // Traiter toutes les adresses du département
+      for (const addr of addresses) {
         if (results.length >= limit) break;
 
         const numeroFormatted = addr.numero ? addr.numero.padStart(4, '0') : null;
@@ -312,7 +310,7 @@ async function findMajicProprietaires(
         }
 
         query += ` LIMIT $${paramIndex}`;
-        params.push(Math.min(10, limit - results.length));
+        params.push(Math.min(50, limit - results.length));
 
         try {
           const result = await pool.query(query, params);
@@ -426,10 +424,11 @@ function groupProprietesParAdresse(proprietes: any[]): ProprieteGroupee[] {
 /**
  * Recherche les propriétaires dans un polygone géographique
  * Utilise l'API externe BAN (api-adresse.data.gouv.fr)
+ * Pas de limite par défaut - prend tout ce qui est trouvé
  */
 export async function searchByPolygon(
   polygon: number[][],
-  limit: number = 500
+  limit: number = 10000
 ): Promise<{
   resultats: Array<{
     proprietaire: Proprietaire;
