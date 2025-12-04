@@ -71,6 +71,10 @@ interface NormalizedAddress {
 // Délai entre les appels API (en ms) pour respecter les limites (50 req/sec max)
 const API_RATE_LIMIT_DELAY = 20;
 
+// Limite de points pour éviter les crashs mémoire
+const MAX_GRID_SIZE = 15; // 15x15 = 225 points max
+const MAX_SAMPLED_POINTS = 50; // Max 50 appels BAN par requête
+
 // Fonction pour attendre
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -254,25 +258,25 @@ async function getBanAddressesInPolygon(
     const width = maxLon - minLon;
     const height = maxLat - minLat;
 
-    // Plus le polygone est grand, plus la grille est dense (jusqu'à 25x25 = 625 points)
-    const gridSize = Math.min(25, Math.max(5, Math.ceil(Math.sqrt(width * height) * 150)));
+    // Grille adaptative mais limitée pour éviter les crashs (max 15x15)
+    const gridSize = Math.min(MAX_GRID_SIZE, Math.max(5, Math.ceil(Math.sqrt(width * height) * 100)));
 
     const gridPoints = generateGridPoints(polygon, gridSize);
-    console.log(`[geo-search] ${gridPoints.length} points de grille générés`);
+    console.log(`[geo-search] ${gridPoints.length} points de grille générés (grille ${gridSize}x${gridSize})`);
 
     if (gridPoints.length === 0) {
       console.warn('[geo-search] Aucun point de grille généré');
       return [];
     }
 
-    // Plus de limite stricte sur les points - on prend tout
-    const maxPoints = Math.min(200, gridPoints.length);
+    // Limiter le nombre de points pour éviter les crashs mémoire
+    const maxPoints = Math.min(MAX_SAMPLED_POINTS, gridPoints.length);
     const selectedPoints = gridPoints.slice(0, maxPoints);
 
     const allAddresses: NormalizedAddress[] = [];
     const seenIds = new Set<string>();
 
-    console.log(`[geo-search] Interrogation de l'API BAN pour ${selectedPoints.length} points...`);
+    console.log(`[geo-search] Interrogation de l'API BAN pour ${selectedPoints.length} points (max ${MAX_SAMPLED_POINTS})...`);
 
     let successCount = 0;
     let errorCount = 0;
@@ -515,6 +519,9 @@ function groupProprietesParAdresse(proprietes: any[]): ProprieteGroupee[] {
  * Recherche les propriétaires dans un polygone géographique
  * Utilise l'API externe BAN (api-adresse.data.gouv.fr)
  * Pas de limite par défaut - prend tout ce qui est trouvé
+ * 
+ * Note: Pour les grandes zones, divisez en plusieurs petits polygones
+ * car le serveur est limité à 50 points BAN par requête pour éviter les crashs
  */
 export async function searchByPolygon(
   polygon: number[][],
