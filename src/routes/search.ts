@@ -217,21 +217,45 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
 
       // Mode streaming NDJSON pour les grandes requêtes
       if (stream) {
-        reply.raw.writeHead(200, {
+        // Hijack the reply to get full control over the response
+        reply.hijack();
+        
+        const res = reply.raw;
+        res.writeHead(200, {
           'Content-Type': 'application/x-ndjson',
           'Transfer-Encoding': 'chunked',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no', // Disable nginx buffering
         });
 
-        // Envoyer un heartbeat initial
-        reply.raw.write(JSON.stringify({ type: 'start', message: 'Recherche géographique démarrée' }) + '\n');
+        // Helper function to write and flush
+        const writeAndFlush = (data: string) => {
+          res.write(data);
+          // Force flush if available
+          if (typeof (res as any).flush === 'function') {
+            (res as any).flush();
+          }
+        };
+
+        // Envoyer un heartbeat initial immédiatement
+        writeAndFlush(JSON.stringify({ type: 'start', message: 'Recherche géographique démarrée', timestamp: new Date().toISOString() }) + '\n');
+
+        // Setup heartbeat interval to keep connection alive
+        let heartbeatCount = 0;
+        const heartbeatInterval = setInterval(() => {
+          heartbeatCount++;
+          writeAndFlush(JSON.stringify({ type: 'heartbeat', count: heartbeatCount, message: 'Traitement en cours...', timestamp: new Date().toISOString() }) + '\n');
+        }, 5000); // Every 5 seconds
 
         try {
           const result = await searchByPolygon(polygon, effectiveLimit);
 
+          // Clear heartbeat
+          clearInterval(heartbeatInterval);
+
           // Envoyer le résultat final
-          reply.raw.write(JSON.stringify({
+          writeAndFlush(JSON.stringify({
             type: 'result',
             success: true,
             query: {
@@ -246,19 +270,25 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
               adresses_matchees: result.adresses_matchees,
             },
             limites_appliquees: result.limites_appliquees,
+            timestamp: new Date().toISOString(),
           }) + '\n');
 
-          reply.raw.end();
+          // Send completion message
+          writeAndFlush(JSON.stringify({ type: 'complete', message: 'Recherche terminée', timestamp: new Date().toISOString() }) + '\n');
+
+          res.end();
         } catch (error) {
+          clearInterval(heartbeatInterval);
           console.error('Erreur recherche géographique (stream):', error);
-          reply.raw.write(JSON.stringify({
+          writeAndFlush(JSON.stringify({
             type: 'error',
             success: false,
             error: 'Erreur interne du serveur',
             code: 'INTERNAL_ERROR',
             details: error instanceof Error ? error.message : 'Erreur inconnue',
+            timestamp: new Date().toISOString(),
           }) + '\n');
-          reply.raw.end();
+          res.end();
         }
         return;
       }
