@@ -68,8 +68,8 @@ interface NormalizedAddress {
   lat: number;
 }
 
-// Délai entre les appels API (en ms) pour respecter les limites
-const API_RATE_LIMIT_DELAY = 50;
+// Délai entre les appels API (en ms) pour respecter les limites (50 req/sec max)
+const API_RATE_LIMIT_DELAY = 20;
 
 // Fonction pour attendre
 function sleep(ms: number): Promise<void> {
@@ -235,7 +235,7 @@ async function getBanAddressesInPolygon(
       }
     }
 
-    // Rate limiting plus léger
+    // Rate limiting (50 req/sec)
     await sleep(API_RATE_LIMIT_DELAY);
   }
 
