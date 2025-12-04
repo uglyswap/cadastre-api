@@ -169,10 +169,20 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
   );
 
   // Route: Recherche par zone géographique (polygone)
+  // Timeout étendu à 5 minutes pour les grandes zones
   fastify.post<{ Body: SearchByPolygonBody }>(
     '/search/geo',
-    { ...authHook },
+    {
+      ...authHook,
+      config: {
+        // 5 minutes timeout pour les grandes recherches géographiques
+        requestTimeout: 300000,
+      },
+    },
     async (request: FastifyRequest<{ Body: SearchByPolygonBody }>, reply: FastifyReply) => {
+      // Définir le timeout de la connexion
+      request.raw.setTimeout(300000);
+      
       const { polygon, limit } = request.body;
 
       // Validation du polygone
