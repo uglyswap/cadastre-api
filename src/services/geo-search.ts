@@ -429,7 +429,7 @@ function groupProprietesParAdresse(proprietes: any[]): ProprieteGroupee[] {
  */
 export async function searchByPolygon(
   polygon: number[][],
-  limit: number = 100
+  limit: number = 500
 ): Promise<{
   resultats: Array<{
     proprietaire: Proprietaire;
