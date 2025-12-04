@@ -2,13 +2,11 @@
  * Service de recherche géographique
  * Utilise l'API externe BAN (api-adresse.data.gouv.fr)
  * pour trouver les propriétaires dans un polygone
- * 
- * IMPORTANT: Le réseau a un timeout de ~50s, donc on doit
- * terminer le traitement en moins de 30s pour être sûr.
  */
 
 import { pool } from './database.js';
 import { resolveTablesForDepartment } from '../utils/table-resolver.js';
+import { enrichSiren } from './entreprises-api.js';
 import {
   LocalRaw,
   Proprietaire,
@@ -73,12 +71,11 @@ interface NormalizedAddress {
 // Délai entre les appels API (en ms) pour respecter les limites (50 req/sec max)
 const API_RATE_LIMIT_DELAY = 20;
 
-// Limites TRES strictes pour garantir une réponse en <30s
-// Le réseau a un timeout de ~50s qu'on ne peut pas changer
-const MAX_GRID_SIZE = 6; // 6x6 = 36 points max
-const MAX_SAMPLED_POINTS = 10; // Max 10 appels BAN par requête (~200ms)
-const MAX_MAJIC_RESULTS = 200; // Max 200 propriétés MAJIC
-const MAX_COMMUNES = 3; // Max 3 départements traités
+// Limites raisonnables pour la recherche géographique
+const MAX_GRID_SIZE = 15; // 15x15 = 225 points max
+const MAX_SAMPLED_POINTS = 50; // Max 50 appels BAN par requête
+const MAX_MAJIC_RESULTS = 1000; // Max 1000 propriétés MAJIC
+const MAX_COMMUNES = 10; // Max 10 départements traités
 
 // Fonction pour attendre
 function sleep(ms: number): Promise<void> {
@@ -157,18 +154,19 @@ function generateGridPoints(polygon: number[][], gridSize: number = 10): Array<[
   }
 }
 
-// Appelle l'API BAN reverse pour un point (timeout court)
+// Appelle l'API BAN reverse pour un point
 async function reverseGeocode(lon: number, lat: number): Promise<NormalizedAddress[]> {
   try {
-    const url = `https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}&limit=3`;
+    const url = `https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}&limit=10`;
     
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
     
     const response = await fetch(url, { signal: controller.signal });
     clearTimeout(timeoutId);
 
     if (!response.ok) {
+      console.warn(`[geo-search] API BAN erreur ${response.status} pour ${lon},${lat}`);
       return [];
     }
 
@@ -181,6 +179,7 @@ async function reverseGeocode(lon: number, lat: number): Promise<NormalizedAddre
     try {
       data = JSON.parse(text);
     } catch (parseError) {
+      console.warn(`[geo-search] Erreur parsing JSON BAN pour ${lon},${lat}`);
       return [];
     }
 
@@ -207,6 +206,11 @@ async function reverseGeocode(lon: number, lat: number): Promise<NormalizedAddre
       };
     });
   } catch (error: any) {
+    if (error.name === 'AbortError') {
+      console.warn(`[geo-search] Timeout API BAN pour ${lon},${lat}`);
+    } else {
+      console.warn(`[geo-search] Erreur API BAN pour ${lon},${lat}:`, error.message || error);
+    }
     return [];
   }
 }
@@ -245,28 +249,39 @@ function normalizeCommuneForMatching(commune: string): string {
 
 // Récupère les adresses BAN dans un polygone via l'API externe
 async function getBanAddressesInPolygon(
-  polygon: number[][]
+  polygon: number[][],
+  limit: number = 10000
 ): Promise<NormalizedAddress[]> {
   try {
+    console.log(`[geo-search] Génération de la grille de points...`);
+
+    // Calculer la taille de grille en fonction de la surface du polygone
     const { minLon, maxLon, minLat, maxLat } = getBoundingBox(polygon);
     const width = maxLon - minLon;
     const height = maxLat - minLat;
 
-    // Grille très limitée (max 6x6)
-    const gridSize = Math.min(MAX_GRID_SIZE, Math.max(3, Math.ceil(Math.sqrt(width * height) * 30)));
+    // Grille adaptative (max 15x15)
+    const gridSize = Math.min(MAX_GRID_SIZE, Math.max(5, Math.ceil(Math.sqrt(width * height) * 100)));
 
     const gridPoints = generateGridPoints(polygon, gridSize);
+    console.log(`[geo-search] ${gridPoints.length} points de grille générés (grille ${gridSize}x${gridSize})`);
 
     if (gridPoints.length === 0) {
+      console.warn('[geo-search] Aucun point de grille généré');
       return [];
     }
 
-    // Limiter strictement le nombre de points
+    // Limiter le nombre de points
     const maxPoints = Math.min(MAX_SAMPLED_POINTS, gridPoints.length);
     const selectedPoints = gridPoints.slice(0, maxPoints);
 
     const allAddresses: NormalizedAddress[] = [];
     const seenIds = new Set<string>();
+
+    console.log(`[geo-search] Interrogation de l'API BAN pour ${selectedPoints.length} points...`);
+
+    let successCount = 0;
+    let errorCount = 0;
 
     for (const [lon, lat] of selectedPoints) {
       try {
@@ -278,14 +293,17 @@ async function getBanAddressesInPolygon(
             allAddresses.push(addr);
           }
         }
+        successCount++;
       } catch (error) {
-        // Ignorer les erreurs
+        errorCount++;
+        console.warn(`[geo-search] Erreur point ${lon},${lat}:`, error);
       }
 
-      // Rate limiting
+      // Rate limiting (50 req/sec)
       await sleep(API_RATE_LIMIT_DELAY);
     }
 
+    console.log(`[geo-search] ${allAddresses.length} adresses uniques trouvées via API BAN (${successCount} succès, ${errorCount} erreurs)`);
     return allAddresses;
   } catch (error) {
     console.error('[geo-search] Erreur getBanAddressesInPolygon:', error);
@@ -295,12 +313,15 @@ async function getBanAddressesInPolygon(
 
 // Trouve les propriétaires MAJIC correspondant aux adresses BAN
 async function findMajicProprietaires(
-  banAddresses: NormalizedAddress[]
+  banAddresses: NormalizedAddress[],
+  limit: number = 10000
 ): Promise<Array<LocalRaw & { ban_lon: number; ban_lat: number }>> {
   if (banAddresses.length === 0) return [];
 
+  const effectiveLimit = Math.min(limit, MAX_MAJIC_RESULTS);
+
   try {
-    // Grouper par département
+    // Grouper par département pour optimiser les requêtes
     const byDepartement = new Map<string, NormalizedAddress[]>();
     for (const addr of banAddresses) {
       const dept = addr.departement;
@@ -316,63 +337,66 @@ async function findMajicProprietaires(
 
     let deptCount = 0;
     for (const [dept, addresses] of byDepartement) {
-      if (results.length >= MAX_MAJIC_RESULTS || deptCount >= MAX_COMMUNES) break;
+      if (results.length >= effectiveLimit || deptCount >= MAX_COMMUNES) break;
       deptCount++;
 
       let tables: string[] = [];
       try {
         tables = await resolveTablesForDepartment(dept);
       } catch (error) {
+        console.warn(`[geo-search] Erreur résolution tables pour ${dept}:`, error);
         continue;
       }
       
       if (tables.length === 0) continue;
 
-      const table = tables[0];
-      
-      for (const addr of addresses) {
-        if (results.length >= MAX_MAJIC_RESULTS) break;
+      for (const table of tables) {
+        if (results.length >= effectiveLimit) break;
 
-        try {
-          const numeroFormatted = addr.numero ? addr.numero.padStart(4, '0') : null;
-          const voieNormalized = normalizeVoieForMatching(addr.nom_voie);
-          const communeNormalized = normalizeCommuneForMatching(addr.nom_commune);
+        for (const addr of addresses) {
+          if (results.length >= effectiveLimit) break;
 
-          let query = `
-            SELECT *, $1::float as ban_lon, $2::float as ban_lat
-            FROM "${table}"
-            WHERE 1=1
-          `;
-          const params: any[] = [addr.lon, addr.lat];
-          let paramIndex = 3;
+          try {
+            const numeroFormatted = addr.numero ? addr.numero.padStart(4, '0') : null;
+            const voieNormalized = normalizeVoieForMatching(addr.nom_voie);
+            const communeNormalized = normalizeCommuneForMatching(addr.nom_commune);
 
-          if (numeroFormatted) {
-            query += ` AND "n°_voirie" = $${paramIndex}`;
-            params.push(numeroFormatted);
-            paramIndex++;
+            let query = `
+              SELECT *, $1::float as ban_lon, $2::float as ban_lat
+              FROM "${table}"
+              WHERE 1=1
+            `;
+            const params: any[] = [addr.lon, addr.lat];
+            let paramIndex = 3;
+
+            if (numeroFormatted) {
+              query += ` AND "n°_voirie" = $${paramIndex}`;
+              params.push(numeroFormatted);
+              paramIndex++;
+            }
+
+            if (voieNormalized.length >= 3) {
+              query += ` AND UPPER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $${paramIndex}`;
+              params.push(`%${voieNormalized}%`);
+              paramIndex++;
+            }
+
+            if (communeNormalized.length >= 2) {
+              query += ` AND UPPER(TRANSLATE(nom_de_la_commune, 'àâäéèêëïîôùûüç-', 'aaaeeeeiioouuc ')) ILIKE $${paramIndex}`;
+              params.push(`%${communeNormalized.substring(0, 20)}%`);
+              paramIndex++;
+            }
+
+            query += ` LIMIT $${paramIndex}`;
+            params.push(Math.min(50, effectiveLimit - results.length));
+
+            const result = await pool.query(query, params);
+            if (result.rows && result.rows.length > 0) {
+              results.push(...result.rows);
+            }
+          } catch (error) {
+            console.warn(`[geo-search] Erreur requête MAJIC:`, error);
           }
-
-          if (voieNormalized.length >= 3) {
-            query += ` AND UPPER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $${paramIndex}`;
-            params.push(`%${voieNormalized}%`);
-            paramIndex++;
-          }
-
-          if (communeNormalized.length >= 2) {
-            query += ` AND UPPER(TRANSLATE(nom_de_la_commune, 'àâäéèêëïîôùûüç-', 'aaaeeeeiioouuc ')) ILIKE $${paramIndex}`;
-            params.push(`%${communeNormalized.substring(0, 20)}%`);
-            paramIndex++;
-          }
-
-          query += ` LIMIT $${paramIndex}`;
-          params.push(Math.min(10, MAX_MAJIC_RESULTS - results.length));
-
-          const result = await pool.query(query, params);
-          if (result.rows && result.rows.length > 0) {
-            results.push(...result.rows);
-          }
-        } catch (error) {
-          // Ignorer les erreurs
         }
       }
     }
@@ -449,6 +473,7 @@ function transformToPropiete(
 
     return { adresse, reference_cadastrale, localisation, proprietaire };
   } catch (error) {
+    console.warn('[geo-search] Erreur transformToPropiete:', error);
     return null;
   }
 }
@@ -485,6 +510,7 @@ function groupProprietesParAdresse(proprietes: any[]): ProprieteGroupee[] {
 
     return Array.from(grouped.values());
   } catch (error) {
+    console.warn('[geo-search] Erreur groupProprietesParAdresse:', error);
     return [];
   }
 }
@@ -493,13 +519,11 @@ function groupProprietesParAdresse(proprietes: any[]): ProprieteGroupee[] {
  * Recherche les propriétaires dans un polygone géographique
  * Utilise l'API externe BAN (api-adresse.data.gouv.fr)
  * 
- * LIMITES STRICTES pour garantir une réponse en <30s:
- * - Max 10 points BAN interrogés
- * - Max 200 propriétés MAJIC retournées
- * - Max 3 départements traités
- * - Pas d'enrichissement SIREN (trop lent)
- * 
- * Pour les grandes zones, divisez en plusieurs petits polygones
+ * Limites:
+ * - Max 50 points BAN interrogés
+ * - Max 1000 propriétés MAJIC retournées
+ * - Max 10 départements traités
+ * - Enrichissement SIREN activé
  */
 export async function searchByPolygon(
   polygon: number[][],
@@ -537,25 +561,31 @@ export async function searchByPolygon(
   };
 
   try {
+    console.log(`[geo-search] Recherche dans polygone (${polygon.length} points), limit=${limit}`);
+
     // Validation du polygone
     if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
+      console.warn('[geo-search] Polygone invalide');
       return emptyResult;
     }
 
     // 1. Récupérer les adresses via API BAN externe
-    const banAddresses = await getBanAddressesInPolygon(polygon);
+    const banAddresses = await getBanAddressesInPolygon(polygon, limit * 5);
+    console.log(`[geo-search] ${banAddresses.length} adresses BAN trouvées`);
 
     if (banAddresses.length === 0) {
       return emptyResult;
     }
 
     // 2. Matcher avec les propriétaires MAJIC
-    const majicResults = await findMajicProprietaires(banAddresses);
+    const majicResults = await findMajicProprietaires(banAddresses, limit * 3);
+    console.log(`[geo-search] ${majicResults.length} propriétés MAJIC matchées`);
 
     // 3. Grouper par propriétaire
     const proprietairesMap = new Map<string, {
       proprietaire: Proprietaire;
       proprietes: any[];
+      sirens: Set<string>;
       coords: { lat: number; lon: number } | null;
     }>();
 
@@ -570,18 +600,20 @@ export async function searchByPolygon(
           proprietairesMap.set(key, {
             proprietaire: propriete.proprietaire,
             proprietes: [],
+            sirens: new Set(),
             coords: raw.ban_lat && raw.ban_lon ? { lat: raw.ban_lat, lon: raw.ban_lon } : null,
           });
         }
 
         const entry = proprietairesMap.get(key)!;
         entry.proprietes.push(propriete);
+        if (raw['n°_siren']) entry.sirens.add(raw['n°_siren']);
       } catch (error) {
-        // Ignorer
+        console.warn('[geo-search] Erreur traitement propriété:', error);
       }
     }
 
-    // 4. Construire les résultats (SANS enrichissement SIREN - trop lent)
+    // 4. Enrichir avec API Entreprises et construire les résultats
     const resultats: Array<{
       proprietaire: Proprietaire;
       proprietes: ProprieteGroupee[];
@@ -592,17 +624,31 @@ export async function searchByPolygon(
     }> = [];
 
     let count = 0;
-    const maxResultats = Math.min(limit, 50);
+    const maxResultats = Math.min(limit, 500);
     
     for (const [_, value] of proprietairesMap) {
       if (count >= maxResultats) break;
 
       try {
+        let entreprise: EntrepriseEnrichie | undefined;
+        const sirens = Array.from(value.sirens);
+
+        // Enrichissement SIREN activé
+        if (sirens.length > 0 && sirens[0].length === 9) {
+          try {
+            const enriched = await enrichSiren(sirens[0]);
+            if (enriched) entreprise = enriched;
+          } catch (e) {
+            // Ignorer les erreurs d'enrichissement
+          }
+        }
+
         const proprietesGroupees = groupProprietesParAdresse(value.proprietes);
 
         resultats.push({
           proprietaire: value.proprietaire,
           proprietes: proprietesGroupees,
+          entreprise,
           nombre_adresses: proprietesGroupees.length,
           nombre_lots: value.proprietes.length,
           coordonnees: value.coords || undefined,
@@ -610,7 +656,7 @@ export async function searchByPolygon(
 
         count++;
       } catch (error) {
-        // Ignorer
+        console.warn('[geo-search] Erreur construction résultat:', error);
       }
     }
 
