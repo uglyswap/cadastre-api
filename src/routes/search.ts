@@ -3,7 +3,7 @@ import { searchBySiren, searchByDenomination } from '../services/search.js';
 import { searchByPolygon, searchByPolygonStreaming, getGeoStats, searchByRadius, searchByAddressPostgis, ProprietaireResult } from '../services/geo-search-postgis.js';
 import { authHook } from '../middleware/auth.js';
 
-// BUILD v2.3.1 - 2025-12-05 - Fixed stream termination + typo fix
+// BUILD v2.4.0 - 2025-12-05 - Unlimited enrichment for streaming mode
 
 // Types pour les requêtes
 interface SearchByAddressQuery {
@@ -293,7 +293,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         writeAndFlush(JSON.stringify({ 
           type: 'start', 
           message: 'Recherche géographique PostGIS démarrée (streaming progressif)', 
-          build: 'v2.3.1-robust-stream', 
+          build: 'v2.4.0-unlimited-enrichment', 
           timestamp: new Date().toISOString() 
         }) + '\n');
 
@@ -346,7 +346,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
               },
               limites_appliquees: {
                 max_resultats: effectiveLimit,
-                max_enrichissement: 100,
+                max_enrichissement: 'illimité (streaming)',
               },
               debug: {
                 wkt: stats.wkt.substring(0, 200) + '...',
