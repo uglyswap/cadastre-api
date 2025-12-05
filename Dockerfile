@@ -1,8 +1,9 @@
 # Build stage
 FROM node:20-alpine AS builder
 
-# Force rebuild - timestamp: 2025-12-05T16:30:00Z
-ARG CACHEBUST=20251205163000
+# Force rebuild - timestamp: 2025-12-05T17:00:00Z
+ARG CACHEBUST=20251205170000
+ARG BUILD_VERSION=v2.0.2-fix-columns
 
 WORKDIR /app
 
@@ -17,10 +18,20 @@ RUN npm install
 COPY src/ ./src/
 
 # Compiler TypeScript avec logs
-RUN echo "Building TypeScript..." && npm run build && echo "Build complete - files:" && ls -la dist/services/
+RUN echo "=== BUILD ${BUILD_VERSION} ===" && \
+    echo "CACHEBUST: ${CACHEBUST}" && \
+    npm run build && \
+    echo "=== BUILD COMPLETE ===" && \
+    echo "Files in dist/services/:" && \
+    ls -la dist/services/ && \
+    echo "Checking geo-search-postgis.js content (first 50 lines):" && \
+    head -50 dist/services/geo-search-postgis.js
 
 # Production stage
 FROM node:20-alpine AS production
+
+ARG BUILD_VERSION=v2.0.2-fix-columns
+ENV BUILD_VERSION=${BUILD_VERSION}
 
 WORKDIR /app
 
