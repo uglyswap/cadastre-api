@@ -3,7 +3,7 @@
  * Utilise directement la table proprietaires_geo géocodée (97.99% de couverture)
  * 
  * REMPLACE l'ancienne version qui utilisait l'API BAN externe
- * DEBUG v3 - Added WKT logging and error details
+ * FIX v4 - Colonnes corrigées pour correspondre au schéma réel
  */
 
 import { pool } from './database.js';
@@ -18,8 +18,6 @@ import {
 } from '../types/index.js';
 import {
   decodeNatureVoie,
-  decodeCodeDroit,
-  decodeGroupePersonne,
   decodeFormeJuridique,
   formatAdresseComplete,
   normalizeNomVoie,
@@ -30,6 +28,7 @@ const MAX_RESULTS = 5000;
 const MAX_ENRICHMENT = 100; // Max entreprises à enrichir via API
 
 // Interface pour les résultats bruts de proprietaires_geo
+// Colonnes REELLES de la table proprietaires_geo
 interface ProprietaireGeoRaw {
   id: number;
   departement: string;
@@ -39,19 +38,12 @@ interface ProprietaireGeoRaw {
   section: string;
   numero_plan: string;
   numero_voirie: string;
-  indice_repetition: string;
   nature_voie: string;
   nom_voie: string;
-  batiment: string;
-  entree: string;
-  niveau: string;
-  porte: string;
+  adresse_complete: string;
   siren: string;
   denomination: string;
   forme_juridique: string;
-  groupe_personne: string;
-  code_droit: string;
-  geom: any;
   ban_type: string;
   lon?: number;
   lat?: number;
@@ -83,15 +75,15 @@ function transformToPropiete(raw: ProprietaireGeoRaw): {
 } {
   const adresse: Adresse & { latitude?: number; longitude?: number } = {
     numero: raw.numero_voirie || '',
-    indice_repetition: raw.indice_repetition || '',
+    indice_repetition: '',
     type_voie: decodeNatureVoie(raw.nature_voie),
     nom_voie: normalizeNomVoie(raw.nom_voie),
     code_postal: '',
     commune: raw.nom_commune || '',
     departement: raw.departement || '',
-    adresse_complete: formatAdresseComplete(
+    adresse_complete: raw.adresse_complete || formatAdresseComplete(
       raw.numero_voirie,
-      raw.indice_repetition,
+      '',
       raw.nature_voie,
       raw.nom_voie,
       raw.nom_commune,
@@ -117,10 +109,10 @@ function transformToPropiete(raw: ProprietaireGeoRaw): {
   };
 
   const localisation: LocalisationLocal = {
-    batiment: raw.batiment || '',
-    entree: raw.entree || '',
-    niveau: raw.niveau || '',
-    porte: raw.porte || '',
+    batiment: '',
+    entree: '',
+    niveau: '',
+    porte: '',
   };
 
   const proprietaire: Proprietaire = {
@@ -128,10 +120,10 @@ function transformToPropiete(raw: ProprietaireGeoRaw): {
     denomination: raw.denomination || '',
     forme_juridique: decodeFormeJuridique(raw.forme_juridique),
     forme_juridique_code: raw.forme_juridique || '',
-    groupe: decodeGroupePersonne(raw.groupe_personne),
-    groupe_code: raw.groupe_personne || '',
-    type_droit: decodeCodeDroit(raw.code_droit),
-    type_droit_code: raw.code_droit || '',
+    groupe: '',
+    groupe_code: '',
+    type_droit: '',
+    type_droit_code: '',
   };
 
   return { adresse, reference_cadastrale, localisation, proprietaire };
@@ -221,7 +213,7 @@ export async function searchByPolygon(
   let wkt = '';
   
   try {
-    console.log(`[geo-search-postgis] DEBUG v3 - Recherche dans polygone (${polygon.length} points), limit=${limit}`);
+    console.log(`[geo-search-postgis] FIX v4 - Recherche dans polygone (${polygon.length} points), limit=${limit}`);
 
     // Validation du polygone
     if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
@@ -235,6 +227,7 @@ export async function searchByPolygon(
     console.log(`[geo-search-postgis] WKT généré: ${wkt}`);
 
     // Requête PostGIS directe sur proprietaires_geo
+    // COLONNES CORRIGEES - uniquement celles qui existent dans la table
     const query = `
       SELECT 
         p.id,
@@ -245,18 +238,12 @@ export async function searchByPolygon(
         p.section,
         p.numero_plan,
         p.numero_voirie,
-        p.indice_repetition,
         p.nature_voie,
         p.nom_voie,
-        p.batiment,
-        p.entree,
-        p.niveau,
-        p.porte,
+        p.adresse_complete,
         p.siren,
         p.denomination,
         p.forme_juridique,
-        p.groupe_personne,
-        p.code_droit,
         p.ban_type,
         ST_X(p.geom) as lon,
         ST_Y(p.geom) as lat
@@ -266,7 +253,7 @@ export async function searchByPolygon(
       LIMIT $2
     `;
 
-    console.log(`[geo-search-postgis] Exécution requête PostGIS avec WKT: ${wkt.substring(0, 100)}...`);
+    console.log(`[geo-search-postgis] Exécution requête PostGIS...`);
     const startTime = Date.now();
     
     const result = await pool.query(query, [wkt, effectiveLimit]);
@@ -275,7 +262,7 @@ export async function searchByPolygon(
     console.log(`[geo-search-postgis] ${result.rows.length} propriétés trouvées en ${queryTime}ms`);
 
     if (result.rows.length === 0) {
-      console.log('[geo-search-postgis] Aucun résultat - vérification du WKT et de la requête');
+      console.log('[geo-search-postgis] Aucun résultat');
       return { 
         ...emptyResult, 
         debug: { 
@@ -473,9 +460,24 @@ export async function searchByRadius(
   try {
     const effectiveLimit = Math.min(limit, MAX_RESULTS);
     
+    // Requête avec colonnes corrigées
     const query = `
       SELECT 
-        p.*,
+        p.id,
+        p.departement,
+        p.code_commune,
+        p.nom_commune,
+        p.prefixe_section,
+        p.section,
+        p.numero_plan,
+        p.numero_voirie,
+        p.nature_voie,
+        p.nom_voie,
+        p.adresse_complete,
+        p.siren,
+        p.denomination,
+        p.forme_juridique,
+        p.ban_type,
         ST_X(p.geom) as lon,
         ST_Y(p.geom) as lat,
         ST_Distance(p.geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) as distance
