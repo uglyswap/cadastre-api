@@ -3,7 +3,7 @@ import { searchByAddress, searchBySiren, searchByDenomination } from '../service
 import { searchByPolygon, getGeoStats, searchByRadius } from '../services/geo-search-postgis.js';
 import { authHook } from '../middleware/auth.js';
 
-// BUILD v2.0.0 - 2025-12-05 - PostGIS native geocoding
+// BUILD v2.0.1 - 2025-12-05 - Added debug output for polygon search
 
 // Types pour les requêtes
 interface SearchByAddressQuery {
@@ -248,7 +248,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         };
 
         // Envoyer un heartbeat initial immédiatement avec BUILD marker
-        writeAndFlush(JSON.stringify({ type: 'start', message: 'Recherche géographique PostGIS démarrée', build: 'v2.0.0-postgis', timestamp: new Date().toISOString() }) + '\n');
+        writeAndFlush(JSON.stringify({ type: 'start', message: 'Recherche géographique PostGIS démarrée', build: 'v2.0.1-debug', timestamp: new Date().toISOString() }) + '\n');
 
         // Setup heartbeat interval to keep connection alive
         let heartbeatCount = 0;
@@ -279,6 +279,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
               geocoding_coverage: '97.99%',
             },
             limites_appliquees: result.limites_appliquees,
+            debug: result.debug,
             timestamp: new Date().toISOString(),
           }) + '\n');
 
@@ -321,6 +322,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
             geocoding_coverage: '97.99%',
           },
           limites_appliquees: result.limites_appliquees,
+          debug: result.debug,
         });
       } catch (error) {
         console.error('Erreur recherche géographique:', error);
