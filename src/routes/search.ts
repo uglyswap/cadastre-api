@@ -3,7 +3,7 @@ import { searchBySiren, searchByDenomination } from '../services/search.js';
 import { searchByPolygon, searchByPolygonStreaming, getGeoStats, searchByRadius, searchByAddressPostgis, ProprietaireResult } from '../services/geo-search-postgis.js';
 import { authHook } from '../middleware/auth.js';
 
-// BUILD v2.2.0 - 2025-12-05 - Progressive streaming with enrichment (no timeout)
+// BUILD v2.3.0 - 2025-12-05 - Fixed stream termination (robust close handling)
 
 // Types pour les requêtes
 interface SearchByAddressQuery {
@@ -56,7 +56,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
 
       try {
         // FIX: Utilise searchByAddressPostgis qui cherche dans proprietaires_geo (22M+ géocodés)
-        const { resultats, total_proprietaires, total_lots, debug } = await searchByAddressPostgis(adresse, departement, limit, code_postal);
+        const { resultats, total_proprietaires, total_lots, debug } = await searchByAddressPostgis(adresse, departement, limit, codePostal);
 
         return reply.send({
           success: true,
@@ -232,6 +232,24 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         reply.hijack();
         
         const res = reply.raw;
+        
+        // Track if client has closed connection
+        let clientClosed = false;
+        let streamEnded = false;
+        
+        // Listen for client disconnect
+        res.on('close', () => {
+          if (!streamEnded) {
+            clientClosed = true;
+            console.log('[stream] Client closed connection');
+          }
+        });
+        
+        res.on('error', (err) => {
+          clientClosed = true;
+          console.error('[stream] Response error:', err.message);
+        });
+        
         res.writeHead(200, {
           'Content-Type': 'application/x-ndjson',
           'Transfer-Encoding': 'chunked',
@@ -240,12 +258,34 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           'X-Accel-Buffering': 'no', // Disable nginx buffering
         });
 
-        // Helper function to write and flush
-        const writeAndFlush = (data: string) => {
-          res.write(data);
-          // Force flush if available
-          if (typeof (res as any).flush === 'function') {
-            (res as any).flush();
+        // Helper function to write and flush safely
+        const writeAndFlush = (data: string): boolean => {
+          if (clientClosed || streamEnded) {
+            return false;
+          }
+          try {
+            const canContinue = res.write(data);
+            // Force flush if available
+            if (typeof (res as any).flush === 'function') {
+              (res as any).flush();
+            }
+            return canContinue !== false;
+          } catch (err) {
+            console.error('[stream] Write error:', err);
+            clientClosed = true;
+            return false;
+          }
+        };
+
+        // Safe end function
+        const safeEnd = () => {
+          if (!streamEnded) {
+            streamEnded = true;
+            try {
+              res.end();
+            } catch (err) {
+              console.error('[stream] Error ending response:', err);
+            }
           }
         };
 
@@ -253,7 +293,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         writeAndFlush(JSON.stringify({ 
           type: 'start', 
           message: 'Recherche géographique PostGIS démarrée (streaming progressif)', 
-          build: 'v2.2.0-progressive-streaming', 
+          build: 'v2.3.0-robust-stream', 
           timestamp: new Date().toISOString() 
         }) + '\n');
 
@@ -264,6 +304,11 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
             effectiveLimit,
             // Callback appelé pour CHAQUE propriétaire après enrichissement
             (result: ProprietaireResult, index: number, total: number) => {
+              // Check if client is still connected before writing
+              if (clientClosed) {
+                return; // Skip writing, client disconnected
+              }
+              
               writeAndFlush(JSON.stringify({
                 type: 'proprietaire',
                 index: index + 1,
@@ -281,52 +326,57 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
             }
           );
 
-          // Envoyer le résumé final
-          writeAndFlush(JSON.stringify({
-            type: 'summary',
-            success: true,
-            query: {
-              polygon_points: polygon.length,
-              limit: limit || 'illimité',
-            },
-            stats: {
-              total_proprietaires: stats.total_proprietaires,
-              total_dans_polygone: stats.total_dans_polygone,
-              total_lots: stats.total_lots,
-              enriched_count: stats.enriched_count,
-              geocoding_method: 'postgis_native',
-              geocoding_coverage: '97.99%',
-            },
-            limites_appliquees: {
-              max_resultats: effectiveLimit,
-              max_enrichissement: 100,
-            },
-            debug: {
-              wkt: stats.wkt.substring(0, 200) + '...',
-              query_time_ms: stats.query_time_ms,
-            },
-            timestamp: new Date().toISOString(),
-          }) + '\n');
+          // Only send summary if client is still connected
+          if (!clientClosed) {
+            // Envoyer le résumé final
+            writeAndFlush(JSON.stringify({
+              type: 'summary',
+              success: true,
+              query: {
+                polygon_points: polygon.length,
+                limit: limit || 'illimité',
+              },
+              stats: {
+                total_proprietaires: stats.total_proprietaires,
+                total_dans_polygone: stats.total_dans_polygone,
+                total_lots: stats.total_lots,
+                enriched_count: stats.enriched_count,
+                geocoding_method: 'postgis_native',
+                geocoding_coverage: '97.99%',
+              },
+              limites_appliquees: {
+                max_resultats: effectiveLimit,
+                max_enrichissement: 100,
+              },
+              debug: {
+                wkt: stats.wkt.substring(0, 200) + '...',
+                query_time_ms: stats.query_time_ms,
+              },
+              timestamp: new Date().toISOString(),
+            }) + '\n');
 
-          // Send completion message
-          writeAndFlush(JSON.stringify({ 
-            type: 'complete', 
-            message: 'Recherche terminée avec succès', 
-            timestamp: new Date().toISOString() 
-          }) + '\n');
-
-          res.end();
+            // Send completion message
+            writeAndFlush(JSON.stringify({ 
+              type: 'complete', 
+              message: 'Recherche terminée avec succès', 
+              timestamp: new Date().toISOString() 
+            }) + '\n');
+          }
         } catch (error) {
           console.error('Erreur recherche géographique (stream):', error);
-          writeAndFlush(JSON.stringify({
-            type: 'error',
-            success: false,
-            error: 'Erreur interne du serveur',
-            code: 'INTERNAL_ERROR',
-            details: error instanceof Error ? error.message : 'Erreur inconnue',
-            timestamp: new Date().toISOString(),
-          }) + '\n');
-          res.end();
+          if (!clientClosed) {
+            writeAndFlush(JSON.stringify({
+              type: 'error',
+              success: false,
+              error: 'Erreur interne du serveur',
+              code: 'INTERNAL_ERROR',
+              details: error instanceof Error ? error.message : 'Erreur inconnue',
+              timestamp: new Date().toISOString(),
+            }) + '\n');
+          }
+        } finally {
+          // ALWAYS end the stream properly
+          safeEnd();
         }
         return;
       }
