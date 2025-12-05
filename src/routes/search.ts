@@ -1,9 +1,9 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { searchBySiren, searchByDenomination } from '../services/search.js';
-import { searchByPolygon, getGeoStats, searchByRadius, searchByAddressPostgis } from '../services/geo-search-postgis.js';
+import { searchByPolygon, searchByPolygonStreaming, getGeoStats, searchByRadius, searchByAddressPostgis, ProprietaireResult } from '../services/geo-search-postgis.js';
 import { authHook } from '../middleware/auth.js';
 
-// BUILD v2.1.0 - 2025-12-05 - Route /search/address now uses searchByAddressPostgis (proprietaires_geo table)
+// BUILD v2.2.0 - 2025-12-05 - Progressive streaming with enrichment (no timeout)
 
 // Types pour les requêtes
 interface SearchByAddressQuery {
@@ -181,13 +181,13 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
   );
 
   // Route: Recherche par zone géographique (polygone) - PostGIS native
-  // Utilise NDJSON streaming pour éviter les timeouts sur les grandes zones
+  // Utilise NDJSON streaming PROGRESSIF pour éviter les timeouts sur les grandes zones
   fastify.post<{ Body: SearchByPolygonBody }>(
     '/search/geo',
     { ...authHook },
     async (request: FastifyRequest<{ Body: SearchByPolygonBody }>, reply: FastifyReply) => {
       // Set timeout on raw socket for long-running requests
-      request.raw.setTimeout(300000);
+      request.raw.setTimeout(600000); // 10 minutes max
       
       const { polygon, limit, stream } = request.body;
 
@@ -226,7 +226,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
 
       const effectiveLimit = limit || 10000;
 
-      // Mode streaming NDJSON pour les grandes requêtes
+      // Mode streaming PROGRESSIF NDJSON - envoie chaque résultat dès qu'il est enrichi
       if (stream) {
         // Hijack the reply to get full control over the response
         reply.hijack();
@@ -249,48 +249,74 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           }
         };
 
-        // Envoyer un heartbeat initial immédiatement avec BUILD marker
-        writeAndFlush(JSON.stringify({ type: 'start', message: 'Recherche géographique PostGIS démarrée', build: 'v2.1.0-address-fix', timestamp: new Date().toISOString() }) + '\n');
-
-        // Setup heartbeat interval to keep connection alive
-        let heartbeatCount = 0;
-        const heartbeatInterval = setInterval(() => {
-          heartbeatCount++;
-          writeAndFlush(JSON.stringify({ type: 'heartbeat', count: heartbeatCount, message: 'Traitement en cours...', timestamp: new Date().toISOString() }) + '\n');
-        }, 5000); // Every 5 seconds
+        // Envoyer un message de démarrage
+        writeAndFlush(JSON.stringify({ 
+          type: 'start', 
+          message: 'Recherche géographique PostGIS démarrée (streaming progressif)', 
+          build: 'v2.2.0-progressive-streaming', 
+          timestamp: new Date().toISOString() 
+        }) + '\n');
 
         try {
-          const result = await searchByPolygon(polygon, effectiveLimit);
+          // Utiliser la nouvelle fonction streaming qui envoie chaque résultat via callback
+          const stats = await searchByPolygonStreaming(
+            polygon, 
+            effectiveLimit,
+            // Callback appelé pour CHAQUE propriétaire après enrichissement
+            (result: ProprietaireResult, index: number, total: number) => {
+              writeAndFlush(JSON.stringify({
+                type: 'proprietaire',
+                index: index + 1,
+                total,
+                data: {
+                  proprietaire: result.proprietaire,
+                  proprietes: result.proprietes,
+                  entreprise: result.entreprise,
+                  nombre_adresses: result.nombre_adresses,
+                  nombre_lots: result.nombre_lots,
+                  coordonnees: result.coordonnees,
+                },
+                timestamp: new Date().toISOString(),
+              }) + '\n');
+            }
+          );
 
-          // Clear heartbeat
-          clearInterval(heartbeatInterval);
-
-          // Envoyer le résultat final
+          // Envoyer le résumé final
           writeAndFlush(JSON.stringify({
-            type: 'result',
+            type: 'summary',
             success: true,
             query: {
               polygon_points: polygon.length,
               limit: limit || 'illimité',
             },
-            resultats: result.resultats,
-            total_proprietaires: result.total_proprietaires,
-            total_lots: result.total_lots,
             stats: {
+              total_proprietaires: stats.total_proprietaires,
+              total_dans_polygone: stats.total_dans_polygone,
+              total_lots: stats.total_lots,
+              enriched_count: stats.enriched_count,
               geocoding_method: 'postgis_native',
               geocoding_coverage: '97.99%',
             },
-            limites_appliquees: result.limites_appliquees,
-            debug: result.debug,
+            limites_appliquees: {
+              max_resultats: effectiveLimit,
+              max_enrichissement: 100,
+            },
+            debug: {
+              wkt: stats.wkt.substring(0, 200) + '...',
+              query_time_ms: stats.query_time_ms,
+            },
             timestamp: new Date().toISOString(),
           }) + '\n');
 
           // Send completion message
-          writeAndFlush(JSON.stringify({ type: 'complete', message: 'Recherche terminée', timestamp: new Date().toISOString() }) + '\n');
+          writeAndFlush(JSON.stringify({ 
+            type: 'complete', 
+            message: 'Recherche terminée avec succès', 
+            timestamp: new Date().toISOString() 
+          }) + '\n');
 
           res.end();
         } catch (error) {
-          clearInterval(heartbeatInterval);
           console.error('Erreur recherche géographique (stream):', error);
           writeAndFlush(JSON.stringify({
             type: 'error',
