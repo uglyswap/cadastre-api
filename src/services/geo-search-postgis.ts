@@ -2,7 +2,7 @@
  * Service de recherche géographique avec PostGIS
  * Utilise directement la table proprietaires_geo géocodée (97.99% de couverture)
  * 
- * FIX v5 - COUNT total + LIMIT par propriétaire unique (pas par ligne)
+ * FIX v6 - Ajout searchByAddressPostgis pour recherche par adresse
  */
 
 import { pool } from './database.js';
@@ -160,6 +160,293 @@ function groupProprietesParAdresse(proprietes: any[]): ProprieteGroupee[] {
   return Array.from(grouped.values());
 }
 
+// Types de voie à filtrer
+const TYPES_VOIE = [
+  'rue', 'avenue', 'av', 'boulevard', 'bd', 'impasse', 'imp', 'passage', 'pas',
+  'allee', 'all', 'place', 'pl', 'square', 'sq', 'chemin', 'che', 'route', 'rte',
+  'cours', 'crs', 'quai', 'voie', 'villa', 'vla', 'cite', 'residence', 'res',
+  'sentier', 'sen', 'traverse', 'tra', 'hameau', 'ham', 'lotissement', 'lot'
+];
+
+/**
+ * Extrait le numéro de voirie et le nom de voie depuis une adresse
+ */
+function extractAddressParts(adresse: string): { numero: string | null; nomVoie: string } {
+  let normalized = adresse.trim();
+
+  // Extraire le numéro au début (1-4 chiffres optionnellement suivi de bis/ter)
+  let numero: string | null = null;
+  const matchNumero = normalized.match(/^(\d{1,4})\s*(bis|ter|b|t)?\s+(.+)$/i);
+  if (matchNumero) {
+    numero = matchNumero[1].padStart(4, '0'); // Format: 0005
+    normalized = matchNumero[3];
+  }
+
+  // Supprimer le type de voie s'il est au début
+  const words = normalized.toLowerCase().split(/\s+/);
+  if (words.length > 0 && TYPES_VOIE.includes(words[0])) {
+    words.shift();
+  }
+
+  return { numero, nomVoie: words.join(' ') };
+}
+
+/**
+ * Convertit un code postal en nom de commune pour Paris/Lyon/Marseille
+ */
+function getArrondissementName(ville: 'PARIS' | 'LYON' | 'MARSEILLE', numero: number): string {
+  if (ville === 'PARIS') {
+    return `PARIS ${numero.toString().padStart(2, '0')}`;
+  }
+  const suffix = numero === 1 ? '1ER' : `${numero}EME`;
+  return `${ville} ${suffix}`;
+}
+
+/**
+ * Convertit un code postal en filtre département/commune
+ */
+function codePostalToFilter(codePostal: string): { departement: string; communeName?: string } {
+  const cp = codePostal.trim();
+  if (cp.length !== 5) {
+    return { departement: cp.substring(0, 2) };
+  }
+
+  const dept = cp.substring(0, 2);
+  const suffix = cp.substring(2);
+  const arrondNum = parseInt(suffix, 10);
+
+  // Paris, Lyon, Marseille ont des arrondissements
+  if (dept === '75' && arrondNum >= 1 && arrondNum <= 20) {
+    return { departement: dept, communeName: getArrondissementName('PARIS', arrondNum) };
+  }
+  if (dept === '69' && arrondNum >= 1 && arrondNum <= 9) {
+    return { departement: dept, communeName: getArrondissementName('LYON', arrondNum) };
+  }
+  if (dept === '13' && arrondNum >= 1 && arrondNum <= 16) {
+    return { departement: dept, communeName: getArrondissementName('MARSEILLE', arrondNum) };
+  }
+
+  return { departement: dept };
+}
+
+/**
+ * Recherche par adresse dans la table proprietaires_geo (PostGIS)
+ * Cette fonction remplace searchByAddress de search.ts pour utiliser la table géocodée.
+ * 
+ * @param adresse - L'adresse à rechercher (ex: "5 rue de bruxelles")
+ * @param departement - Code département optionnel (ex: "75")
+ * @param limit - Nombre max de résultats
+ * @param codePostal - Code postal optionnel (ex: "75009")
+ */
+export async function searchByAddressPostgis(
+  adresse: string,
+  departement?: string,
+  limit?: number,
+  codePostal?: string
+): Promise<{
+  resultats: Array<{
+    proprietaire: Proprietaire;
+    proprietes: ProprieteGroupee[];
+    entreprise?: EntrepriseEnrichie;
+    nombre_adresses: number;
+    nombre_lots: number;
+  }>;
+  total_proprietaires: number;
+  total_lots: number;
+  debug?: {
+    numero_recherche: string | null;
+    nom_voie_recherche: string;
+    departement: string | null;
+    commune: string | null;
+  };
+}> {
+  const maxResults = limit || 100;
+  const emptyResult = { resultats: [], total_proprietaires: 0, total_lots: 0 };
+
+  try {
+    // Extraire le numéro et le nom de voie
+    const { numero, nomVoie } = extractAddressParts(adresse);
+    
+    if (!nomVoie || nomVoie.length < 2) {
+      console.log('[searchByAddressPostgis] Nom de voie trop court');
+      return emptyResult;
+    }
+
+    // Traitement du code postal
+    let effectiveDepartement = departement;
+    let communeName: string | undefined;
+
+    if (codePostal) {
+      const cpFilter = codePostalToFilter(codePostal);
+      effectiveDepartement = cpFilter.departement;
+      communeName = cpFilter.communeName;
+    }
+
+    console.log(`[searchByAddressPostgis] Recherche: numero=${numero}, voie="${nomVoie}", dept=${effectiveDepartement}, commune=${communeName}`);
+
+    // Construire la requête SQL
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+    let paramIndex = 1;
+
+    // Recherche fuzzy sur le nom de voie
+    const searchPattern = `%${nomVoie.split(' ').join('%')}%`;
+    conditions.push(`LOWER(TRANSLATE(nom_voie, 'àâäéèêëïîôùûüç', 'aaaeeeeiioouuc')) ILIKE $${paramIndex}`);
+    params.push(searchPattern);
+    paramIndex++;
+
+    // Filtre par numéro de voirie (avec variantes de padding)
+    if (numero) {
+      // Recherche le numéro avec différents formats possibles
+      conditions.push(`(numero_voirie = $${paramIndex} OR numero_voirie = $${paramIndex + 1} OR LTRIM(numero_voirie, '0') = $${paramIndex + 2})`);
+      params.push(numero); // Format paddé: 0005
+      params.push(numero.replace(/^0+/, '')); // Format sans padding: 5
+      params.push(numero.replace(/^0+/, '')); // Pour LTRIM: 5
+      paramIndex += 3;
+    }
+
+    // Filtre par département
+    if (effectiveDepartement) {
+      conditions.push(`departement = $${paramIndex}`);
+      params.push(effectiveDepartement);
+      paramIndex++;
+    }
+
+    // Filtre par nom de commune (pour les arrondissements)
+    if (communeName) {
+      conditions.push(`UPPER(nom_commune) = $${paramIndex}`);
+      params.push(communeName);
+      paramIndex++;
+    }
+
+    // Ajouter le LIMIT
+    params.push(maxResults * 10); // On récupère plus pour grouper ensuite
+
+    const query = `
+      SELECT 
+        id,
+        departement,
+        code_commune,
+        nom_commune,
+        prefixe_section,
+        section,
+        numero_plan,
+        numero_voirie,
+        nature_voie,
+        nom_voie,
+        adresse_complete,
+        siren,
+        denomination,
+        forme_juridique,
+        ban_type,
+        ST_X(geom) as lon,
+        ST_Y(geom) as lat
+      FROM proprietaires_geo
+      WHERE ${conditions.join(' AND ')}
+      LIMIT $${paramIndex}
+    `;
+
+    console.log(`[searchByAddressPostgis] Query avec ${conditions.length} conditions`);
+
+    const result = await pool.query(query, params);
+    console.log(`[searchByAddressPostgis] ${result.rows.length} lignes trouvées`);
+
+    if (result.rows.length === 0) {
+      return {
+        ...emptyResult,
+        debug: {
+          numero_recherche: numero,
+          nom_voie_recherche: nomVoie,
+          departement: effectiveDepartement || null,
+          commune: communeName || null,
+        },
+      };
+    }
+
+    // Grouper par propriétaire (SIREN ou dénomination)
+    const proprietairesMap = new Map<string, {
+      proprietaire: Proprietaire;
+      proprietes: any[];
+      sirens: Set<string>;
+    }>();
+
+    for (const raw of result.rows) {
+      const propriete = transformToPropiete(raw);
+      const key = raw.siren || raw.denomination || 'inconnu';
+
+      if (!proprietairesMap.has(key)) {
+        proprietairesMap.set(key, {
+          proprietaire: propriete.proprietaire,
+          proprietes: [],
+          sirens: new Set(),
+        });
+      }
+
+      const entry = proprietairesMap.get(key)!;
+      entry.proprietes.push(propriete);
+      if (raw.siren) entry.sirens.add(raw.siren);
+    }
+
+    // Limiter au nombre de propriétaires demandé
+    const proprietairesLimites = Array.from(proprietairesMap.entries()).slice(0, maxResults);
+
+    // Enrichir avec API Entreprises et construire les résultats
+    const resultats: Array<{
+      proprietaire: Proprietaire;
+      proprietes: ProprieteGroupee[];
+      entreprise?: EntrepriseEnrichie;
+      nombre_adresses: number;
+      nombre_lots: number;
+    }> = [];
+
+    let enrichmentCount = 0;
+
+    for (const [_, value] of proprietairesLimites) {
+      let entreprise: EntrepriseEnrichie | undefined;
+      const sirens = Array.from(value.sirens);
+
+      if (sirens.length > 0 && sirens[0].length === 9 && enrichmentCount < MAX_ENRICHMENT) {
+        try {
+          const enriched = await enrichSiren(sirens[0]);
+          if (enriched) {
+            entreprise = enriched;
+            enrichmentCount++;
+          }
+        } catch (e) {
+          // Ignorer les erreurs d'enrichissement
+        }
+      }
+
+      const proprietesGroupees = groupProprietesParAdresse(value.proprietes);
+
+      resultats.push({
+        proprietaire: value.proprietaire,
+        proprietes: proprietesGroupees,
+        entreprise,
+        nombre_adresses: proprietesGroupees.length,
+        nombre_lots: value.proprietes.length,
+      });
+    }
+
+    console.log(`[searchByAddressPostgis] ${resultats.length} propriétaires retournés`);
+
+    return {
+      resultats,
+      total_proprietaires: resultats.length,
+      total_lots: result.rows.length,
+      debug: {
+        numero_recherche: numero,
+        nom_voie_recherche: nomVoie,
+        departement: effectiveDepartement || null,
+        commune: communeName || null,
+      },
+    };
+  } catch (error) {
+    console.error('[searchByAddressPostgis] Erreur:', error);
+    return emptyResult;
+  }
+}
+
 /**
  * Recherche les propriétaires dans un polygone géographique
  * Utilise PostGIS ST_Within pour une recherche directe et performante
@@ -209,13 +496,13 @@ export async function searchByPolygon(
       max_resultats: Math.min(limit, MAX_RESULTS),
       max_enrichissement: MAX_ENRICHMENT,
     },
-    mode: 'postgis_direct_v5',
+    mode: 'postgis_direct_v6',
   };
 
   let wkt = '';
   
   try {
-    console.log(`[geo-search-postgis] FIX v5 - Recherche dans polygone (${polygon.length} points), limit=${limit} propriétaires`);
+    console.log(`[geo-search-postgis] FIX v6 - Recherche dans polygone (${polygon.length} points), limit=${limit} propriétaires`);
 
     // Validation du polygone
     if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
@@ -379,7 +666,7 @@ export async function searchByPolygon(
         max_resultats: effectiveLimit,
         max_enrichissement: MAX_ENRICHMENT,
       },
-      mode: 'postgis_direct_v5',
+      mode: 'postgis_direct_v6',
       debug: {
         wkt,
         query_time_ms: queryTime,
@@ -438,7 +725,7 @@ export async function getGeoStats(): Promise<{
       pourcentage_geocode: parseFloat(stats.rows[0].pct),
       par_type: parType,
       postgis_installed: true,
-      mode: 'postgis_direct_v5',
+      mode: 'postgis_direct_v6',
     };
   } catch (error) {
     console.error('[geo-search-postgis] Erreur getGeoStats:', error);
