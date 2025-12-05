@@ -2,7 +2,7 @@
  * Service de recherche géographique avec PostGIS
  * Utilise directement la table proprietaires_geo géocodée (97.99% de couverture)
  * 
- * FIX v7 - Ajout searchByPolygonStreaming pour streaming progressif avec enrichissement
+ * FIX v2.4.0 - Streaming enrichit TOUS les propriétaires avec SIREN valide (plus de limite)
  */
 
 import { pool } from './database.js';
@@ -24,7 +24,8 @@ import {
 
 // Limites pour la recherche géographique
 const MAX_RESULTS = 10000;
-const MAX_ENRICHMENT = 100; // Max entreprises à enrichir via API
+const MAX_ENRICHMENT_BATCH = 100; // Limite pour le mode NON-streaming (batch)
+// Note: Le mode STREAMING n'a PAS de limite d'enrichissement
 
 // Interface pour les résultats bruts de proprietaires_geo
 interface ProprietaireGeoRaw {
@@ -405,7 +406,8 @@ export async function searchByAddressPostgis(
       let entreprise: EntrepriseEnrichie | undefined;
       const sirens = Array.from(value.sirens);
 
-      if (sirens.length > 0 && sirens[0].length === 9 && enrichmentCount < MAX_ENRICHMENT) {
+      // Mode batch: limite à MAX_ENRICHMENT_BATCH
+      if (sirens.length > 0 && sirens[0].length === 9 && enrichmentCount < MAX_ENRICHMENT_BATCH) {
         try {
           const enriched = await enrichSiren(sirens[0]);
           if (enriched) {
@@ -468,6 +470,8 @@ export type StreamCallback = (result: ProprietaireResult, index: number, total: 
  * Recherche par polygone avec STREAMING PROGRESSIF
  * Envoie chaque propriétaire dès qu'il est enrichi via le callback
  * 
+ * v2.4.0: PLUS DE LIMITE D'ENRICHISSEMENT - tous les propriétaires avec SIREN valide sont enrichis
+ * 
  * @param polygon - Array de coordonnées [[lon, lat], ...] format GeoJSON
  * @param limit - Nombre max de PROPRIETAIRES uniques (défaut: 5000)
  * @param onResult - Callback appelé pour chaque propriétaire enrichi
@@ -496,7 +500,7 @@ export async function searchByPolygonStreaming(
   let wkt = '';
   
   try {
-    console.log(`[geo-search-postgis] STREAMING v7 - Recherche dans polygone (${polygon.length} points), limit=${limit}`);
+    console.log(`[geo-search-postgis] STREAMING v2.4.0 - Recherche dans polygone (${polygon.length} points), limit=${limit}, enrichissement=ILLIMITE`);
 
     // Validation du polygone
     if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
@@ -601,12 +605,13 @@ export async function searchByPolygonStreaming(
     let index = 0;
 
     // ETAPE 3: Enrichir et envoyer chaque propriétaire via le callback
+    // v2.4.0: PLUS DE LIMITE - on enrichit TOUS les propriétaires avec SIREN valide
     for (const [_, value] of proprietairesMap) {
       let entreprise: EntrepriseEnrichie | undefined;
       const sirens = Array.from(value.sirens);
 
-      // Enrichissement SIREN (obligatoire mais limité)
-      if (sirens.length > 0 && sirens[0].length === 9 && enrichmentCount < MAX_ENRICHMENT) {
+      // Enrichissement SIREN pour TOUS les propriétaires avec SIREN valide (9 chiffres)
+      if (sirens.length > 0 && sirens[0].length === 9) {
         try {
           const enriched = await enrichSiren(sirens[0]);
           if (enriched) {
@@ -615,6 +620,7 @@ export async function searchByPolygonStreaming(
           }
         } catch (e) {
           // Ignorer les erreurs d'enrichissement
+          console.log(`[geo-search-postgis] Erreur enrichissement SIREN ${sirens[0]}: ${e}`);
         }
       }
 
@@ -634,7 +640,7 @@ export async function searchByPolygonStreaming(
       index++;
     }
 
-    console.log(`[geo-search-postgis] Streaming terminé: ${totalProprietaires} propriétaires, ${enrichmentCount} enrichis`);
+    console.log(`[geo-search-postgis] Streaming terminé: ${totalProprietaires} propriétaires, ${enrichmentCount} enrichis sur ${totalProprietaires}`);
 
     return {
       total_proprietaires: totalProprietaires,
@@ -655,6 +661,7 @@ export async function searchByPolygonStreaming(
  * Utilise PostGIS ST_Within pour une recherche directe et performante
  * 
  * FIX v5: Le limit s'applique maintenant aux PROPRIETAIRES UNIQUES, pas aux lignes SQL
+ * Note: Ce mode BATCH garde une limite d'enrichissement pour éviter les timeouts
  * 
  * @param polygon - Array de coordonnées [[lon, lat], ...] format GeoJSON
  * @param limit - Nombre max de PROPRIETAIRES uniques (défaut: 5000)
@@ -697,15 +704,15 @@ export async function searchByPolygon(
     adresses_matchees: 0,
     limites_appliquees: {
       max_resultats: Math.min(limit, MAX_RESULTS),
-      max_enrichissement: MAX_ENRICHMENT,
+      max_enrichissement: MAX_ENRICHMENT_BATCH,
     },
-    mode: 'postgis_direct_v7',
+    mode: 'postgis_direct_v2.4.0',
   };
 
   let wkt = '';
   
   try {
-    console.log(`[geo-search-postgis] FIX v7 - Recherche dans polygone (${polygon.length} points), limit=${limit} propriétaires`);
+    console.log(`[geo-search-postgis] BATCH v2.4.0 - Recherche dans polygone (${polygon.length} points), limit=${limit} propriétaires`);
 
     // Validation du polygone
     if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
@@ -815,7 +822,7 @@ export async function searchByPolygon(
       if (raw.siren) entry.sirens.add(raw.siren);
     }
 
-    // Enrichir avec API Entreprises (limité pour performance)
+    // Enrichir avec API Entreprises (limité pour le mode BATCH pour éviter timeout)
     const resultats: Array<{
       proprietaire: Proprietaire;
       proprietes: ProprieteGroupee[];
@@ -831,7 +838,8 @@ export async function searchByPolygon(
       let entreprise: EntrepriseEnrichie | undefined;
       const sirens = Array.from(value.sirens);
 
-      if (sirens.length > 0 && sirens[0].length === 9 && enrichmentCount < MAX_ENRICHMENT) {
+      // Mode BATCH: limite à MAX_ENRICHMENT_BATCH pour éviter timeout
+      if (sirens.length > 0 && sirens[0].length === 9 && enrichmentCount < MAX_ENRICHMENT_BATCH) {
         try {
           const enriched = await enrichSiren(sirens[0]);
           if (enriched) {
@@ -866,9 +874,9 @@ export async function searchByPolygon(
       adresses_matchees: result.rows.length,
       limites_appliquees: {
         max_resultats: effectiveLimit,
-        max_enrichissement: MAX_ENRICHMENT,
+        max_enrichissement: MAX_ENRICHMENT_BATCH,
       },
-      mode: 'postgis_direct_v7',
+      mode: 'postgis_direct_v2.4.0',
       debug: {
         wkt,
         query_time_ms: queryTime,
@@ -927,7 +935,7 @@ export async function getGeoStats(): Promise<{
       pourcentage_geocode: parseFloat(stats.rows[0].pct),
       par_type: parType,
       postgis_installed: true,
-      mode: 'postgis_direct_v7',
+      mode: 'postgis_direct_v2.4.0',
     };
   } catch (error) {
     console.error('[geo-search-postgis] Erreur getGeoStats:', error);
@@ -970,7 +978,7 @@ export async function searchByRadius(
     total_lots: 0,
     limites_appliquees: {
       max_resultats: Math.min(limit, MAX_RESULTS),
-      max_enrichissement: MAX_ENRICHMENT,
+      max_enrichissement: MAX_ENRICHMENT_BATCH,
     },
   };
 
@@ -1052,7 +1060,7 @@ export async function searchByRadius(
       let entreprise: EntrepriseEnrichie | undefined;
       const sirens = Array.from(value.sirens);
 
-      if (sirens.length > 0 && sirens[0].length === 9 && enrichCount < MAX_ENRICHMENT) {
+      if (sirens.length > 0 && sirens[0].length === 9 && enrichCount < MAX_ENRICHMENT_BATCH) {
         try {
           const enriched = await enrichSiren(sirens[0]);
           if (enriched) {
@@ -1078,7 +1086,7 @@ export async function searchByRadius(
       total_lots: totalLots,
       limites_appliquees: {
         max_resultats: effectiveLimit,
-        max_enrichissement: MAX_ENRICHMENT,
+        max_enrichissement: MAX_ENRICHMENT_BATCH,
       },
     };
   } catch (error) {
