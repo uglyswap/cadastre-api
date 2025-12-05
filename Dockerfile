@@ -1,8 +1,8 @@
 # Build stage
 FROM node:20-alpine AS builder
 
-# Force rebuild with timestamp
-ARG CACHEBUST=1
+# Force rebuild - timestamp: 2025-12-05T16:30:00Z
+ARG CACHEBUST=20251205163000
 
 WORKDIR /app
 
@@ -13,11 +13,11 @@ COPY tsconfig.json ./
 # Installer les dépendances
 RUN npm install
 
-# Copier le code source
+# Copier le code source - FORCE FRESH COPY
 COPY src/ ./src/
 
-# Compiler TypeScript
-RUN npm run build
+# Compiler TypeScript avec logs
+RUN echo "Building TypeScript..." && npm run build && echo "Build complete - files:" && ls -la dist/services/
 
 # Production stage
 FROM node:20-alpine AS production
