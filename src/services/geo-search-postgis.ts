@@ -3,6 +3,7 @@
  * Utilise directement la table proprietaires_geo géocodée (97.99% de couverture)
  * 
  * REMPLACE l'ancienne version qui utilisait l'API BAN externe
+ * DEBUG v3 - Added WKT logging and error details
  */
 
 import { pool } from './database.js';
@@ -198,6 +199,11 @@ export async function searchByPolygon(
     max_enrichissement: number;
   };
   mode: string;
+  debug?: {
+    wkt: string;
+    error?: string;
+    query_time_ms?: number;
+  };
 }> {
   const emptyResult = {
     resultats: [],
@@ -212,17 +218,21 @@ export async function searchByPolygon(
     mode: 'postgis_direct',
   };
 
+  let wkt = '';
+  
   try {
-    console.log(`[geo-search-postgis] Recherche dans polygone (${polygon.length} points), limit=${limit}`);
+    console.log(`[geo-search-postgis] DEBUG v3 - Recherche dans polygone (${polygon.length} points), limit=${limit}`);
 
     // Validation du polygone
     if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
       console.warn('[geo-search-postgis] Polygone invalide');
-      return emptyResult;
+      return { ...emptyResult, debug: { wkt: '', error: 'Polygone invalide (moins de 3 points)' } };
     }
 
     const effectiveLimit = Math.min(limit, MAX_RESULTS);
-    const wkt = polygonToWKT(polygon);
+    wkt = polygonToWKT(polygon);
+    
+    console.log(`[geo-search-postgis] WKT généré: ${wkt}`);
 
     // Requête PostGIS directe sur proprietaires_geo
     const query = `
@@ -256,7 +266,7 @@ export async function searchByPolygon(
       LIMIT $2
     `;
 
-    console.log(`[geo-search-postgis] Exécution requête PostGIS...`);
+    console.log(`[geo-search-postgis] Exécution requête PostGIS avec WKT: ${wkt.substring(0, 100)}...`);
     const startTime = Date.now();
     
     const result = await pool.query(query, [wkt, effectiveLimit]);
@@ -265,7 +275,15 @@ export async function searchByPolygon(
     console.log(`[geo-search-postgis] ${result.rows.length} propriétés trouvées en ${queryTime}ms`);
 
     if (result.rows.length === 0) {
-      return emptyResult;
+      console.log('[geo-search-postgis] Aucun résultat - vérification du WKT et de la requête');
+      return { 
+        ...emptyResult, 
+        debug: { 
+          wkt, 
+          error: 'Aucun résultat trouvé',
+          query_time_ms: queryTime 
+        } 
+      };
     }
 
     // Grouper par propriétaire (SIREN ou dénomination)
@@ -348,10 +366,21 @@ export async function searchByPolygon(
         max_enrichissement: MAX_ENRICHMENT,
       },
       mode: 'postgis_direct',
+      debug: {
+        wkt,
+        query_time_ms: queryTime,
+      },
     };
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Erreur inconnue';
     console.error('[geo-search-postgis] Erreur critique:', error);
-    return emptyResult;
+    return { 
+      ...emptyResult, 
+      debug: { 
+        wkt, 
+        error: errorMessage 
+      } 
+    };
   }
 }
 
