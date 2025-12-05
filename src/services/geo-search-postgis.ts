@@ -2,7 +2,7 @@
  * Service de recherche géographique avec PostGIS
  * Utilise directement la table proprietaires_geo géocodée (97.99% de couverture)
  * 
- * FIX v6 - Ajout searchByAddressPostgis pour recherche par adresse
+ * FIX v7 - Ajout searchByPolygonStreaming pour streaming progressif avec enrichissement
  */
 
 import { pool } from './database.js';
@@ -448,6 +448,209 @@ export async function searchByAddressPostgis(
 }
 
 /**
+ * Type pour le résultat d'un propriétaire individuel (streaming)
+ */
+export interface ProprietaireResult {
+  proprietaire: Proprietaire;
+  proprietes: ProprieteGroupee[];
+  entreprise?: EntrepriseEnrichie;
+  nombre_adresses: number;
+  nombre_lots: number;
+  coordonnees?: { lat: number; lon: number };
+}
+
+/**
+ * Type pour le callback de streaming
+ */
+export type StreamCallback = (result: ProprietaireResult, index: number, total: number) => void;
+
+/**
+ * Recherche par polygone avec STREAMING PROGRESSIF
+ * Envoie chaque propriétaire dès qu'il est enrichi via le callback
+ * 
+ * @param polygon - Array de coordonnées [[lon, lat], ...] format GeoJSON
+ * @param limit - Nombre max de PROPRIETAIRES uniques (défaut: 5000)
+ * @param onResult - Callback appelé pour chaque propriétaire enrichi
+ */
+export async function searchByPolygonStreaming(
+  polygon: number[][],
+  limit: number = 5000,
+  onResult: StreamCallback
+): Promise<{
+  total_proprietaires: number;
+  total_dans_polygone: number;
+  total_lots: number;
+  enriched_count: number;
+  wkt: string;
+  query_time_ms: number;
+}> {
+  const emptyResult = {
+    total_proprietaires: 0,
+    total_dans_polygone: 0,
+    total_lots: 0,
+    enriched_count: 0,
+    wkt: '',
+    query_time_ms: 0,
+  };
+
+  let wkt = '';
+  
+  try {
+    console.log(`[geo-search-postgis] STREAMING v7 - Recherche dans polygone (${polygon.length} points), limit=${limit}`);
+
+    // Validation du polygone
+    if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
+      console.warn('[geo-search-postgis] Polygone invalide');
+      return emptyResult;
+    }
+
+    const effectiveLimit = Math.min(limit, MAX_RESULTS);
+    wkt = polygonToWKT(polygon);
+    
+    console.log(`[geo-search-postgis] WKT généré: ${wkt.substring(0, 100)}...`);
+
+    // ETAPE 1: Compter le VRAI nombre de propriétaires uniques dans le polygone
+    const countQuery = `
+      SELECT 
+        COUNT(DISTINCT COALESCE(NULLIF(siren, ''), denomination)) as unique_proprietaires,
+        COUNT(*) as total_lignes
+      FROM proprietaires_geo
+      WHERE geom IS NOT NULL
+        AND ST_Within(geom, ST_GeomFromText($1, 4326))
+    `;
+    
+    const countResult = await pool.query(countQuery, [wkt]);
+    const totalDansPolygone = parseInt(countResult.rows[0].unique_proprietaires) || 0;
+    const totalLignes = parseInt(countResult.rows[0].total_lignes) || 0;
+    
+    console.log(`[geo-search-postgis] COUNT: ${totalDansPolygone} propriétaires uniques, ${totalLignes} lignes`);
+
+    if (totalDansPolygone === 0) {
+      console.log('[geo-search-postgis] Aucun résultat');
+      return emptyResult;
+    }
+
+    // ETAPE 2: Récupérer les données en limitant par PROPRIETAIRE UNIQUE
+    const queryStart = Date.now();
+    
+    const query = `
+      WITH proprietaires_uniques AS (
+        SELECT DISTINCT COALESCE(NULLIF(siren, ''), denomination) as proprio_key
+        FROM proprietaires_geo
+        WHERE geom IS NOT NULL
+          AND ST_Within(geom, ST_GeomFromText($1, 4326))
+        LIMIT $2
+      )
+      SELECT 
+        p.id,
+        p.departement,
+        p.code_commune,
+        p.nom_commune,
+        p.prefixe_section,
+        p.section,
+        p.numero_plan,
+        p.numero_voirie,
+        p.nature_voie,
+        p.nom_voie,
+        p.adresse_complete,
+        p.siren,
+        p.denomination,
+        p.forme_juridique,
+        p.ban_type,
+        ST_X(p.geom) as lon,
+        ST_Y(p.geom) as lat
+      FROM proprietaires_geo p
+      WHERE p.geom IS NOT NULL
+        AND ST_Within(p.geom, ST_GeomFromText($1, 4326))
+        AND COALESCE(NULLIF(p.siren, ''), p.denomination) IN (SELECT proprio_key FROM proprietaires_uniques)
+    `;
+
+    const result = await pool.query(query, [wkt, effectiveLimit]);
+    const queryTime = Date.now() - queryStart;
+    
+    console.log(`[geo-search-postgis] ${result.rows.length} lignes pour ${effectiveLimit} propriétaires max en ${queryTime}ms`);
+
+    // Grouper par propriétaire
+    const proprietairesMap = new Map<string, {
+      proprietaire: Proprietaire;
+      proprietes: any[];
+      sirens: Set<string>;
+      coords: { lat: number; lon: number } | null;
+    }>();
+
+    for (const raw of result.rows) {
+      const propriete = transformToPropiete(raw);
+      const key = raw.siren || raw.denomination || 'inconnu';
+
+      if (!proprietairesMap.has(key)) {
+        proprietairesMap.set(key, {
+          proprietaire: propriete.proprietaire,
+          proprietes: [],
+          sirens: new Set(),
+          coords: raw.lat && raw.lon ? { lat: raw.lat, lon: raw.lon } : null,
+        });
+      }
+
+      const entry = proprietairesMap.get(key)!;
+      entry.proprietes.push(propriete);
+      if (raw.siren) entry.sirens.add(raw.siren);
+    }
+
+    const totalProprietaires = proprietairesMap.size;
+    let enrichmentCount = 0;
+    let index = 0;
+
+    // ETAPE 3: Enrichir et envoyer chaque propriétaire via le callback
+    for (const [_, value] of proprietairesMap) {
+      let entreprise: EntrepriseEnrichie | undefined;
+      const sirens = Array.from(value.sirens);
+
+      // Enrichissement SIREN (obligatoire mais limité)
+      if (sirens.length > 0 && sirens[0].length === 9 && enrichmentCount < MAX_ENRICHMENT) {
+        try {
+          const enriched = await enrichSiren(sirens[0]);
+          if (enriched) {
+            entreprise = enriched;
+            enrichmentCount++;
+          }
+        } catch (e) {
+          // Ignorer les erreurs d'enrichissement
+        }
+      }
+
+      const proprietesGroupees = groupProprietesParAdresse(value.proprietes);
+
+      // Envoyer le résultat via callback IMMEDIATEMENT après enrichissement
+      const proprietaireResult: ProprietaireResult = {
+        proprietaire: value.proprietaire,
+        proprietes: proprietesGroupees,
+        entreprise,
+        nombre_adresses: proprietesGroupees.length,
+        nombre_lots: value.proprietes.length,
+        coordonnees: value.coords || undefined,
+      };
+
+      onResult(proprietaireResult, index, totalProprietaires);
+      index++;
+    }
+
+    console.log(`[geo-search-postgis] Streaming terminé: ${totalProprietaires} propriétaires, ${enrichmentCount} enrichis`);
+
+    return {
+      total_proprietaires: totalProprietaires,
+      total_dans_polygone: totalDansPolygone,
+      total_lots: result.rows.length,
+      enriched_count: enrichmentCount,
+      wkt,
+      query_time_ms: queryTime,
+    };
+  } catch (error) {
+    console.error('[geo-search-postgis] Erreur streaming:', error);
+    throw error;
+  }
+}
+
+/**
  * Recherche les propriétaires dans un polygone géographique
  * Utilise PostGIS ST_Within pour une recherche directe et performante
  * 
@@ -496,13 +699,13 @@ export async function searchByPolygon(
       max_resultats: Math.min(limit, MAX_RESULTS),
       max_enrichissement: MAX_ENRICHMENT,
     },
-    mode: 'postgis_direct_v6',
+    mode: 'postgis_direct_v7',
   };
 
   let wkt = '';
   
   try {
-    console.log(`[geo-search-postgis] FIX v6 - Recherche dans polygone (${polygon.length} points), limit=${limit} propriétaires`);
+    console.log(`[geo-search-postgis] FIX v7 - Recherche dans polygone (${polygon.length} points), limit=${limit} propriétaires`);
 
     // Validation du polygone
     if (!polygon || !Array.isArray(polygon) || polygon.length < 3) {
@@ -547,7 +750,6 @@ export async function searchByPolygon(
     }
 
     // ETAPE 2: Récupérer les données en limitant par PROPRIETAIRE UNIQUE
-    // On utilise une sous-requête pour d'abord identifier les N premiers propriétaires
     const queryStart = Date.now();
     
     const query = `
@@ -666,7 +868,7 @@ export async function searchByPolygon(
         max_resultats: effectiveLimit,
         max_enrichissement: MAX_ENRICHMENT,
       },
-      mode: 'postgis_direct_v6',
+      mode: 'postgis_direct_v7',
       debug: {
         wkt,
         query_time_ms: queryTime,
@@ -725,7 +927,7 @@ export async function getGeoStats(): Promise<{
       pourcentage_geocode: parseFloat(stats.rows[0].pct),
       par_type: parType,
       postgis_installed: true,
-      mode: 'postgis_direct_v6',
+      mode: 'postgis_direct_v7',
     };
   } catch (error) {
     console.error('[geo-search-postgis] Erreur getGeoStats:', error);
