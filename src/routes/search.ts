@@ -3,7 +3,7 @@ import { searchBySiren, searchByDenomination } from '../services/search.js';
 import { searchByPolygon, searchByPolygonStreaming, getGeoStats, searchByRadius, searchByAddressPostgis, ProprietaireResult } from '../services/geo-search-postgis.js';
 import { authHook } from '../middleware/auth.js';
 
-// BUILD v2.3.0 - 2025-12-05 - Fixed stream termination (robust close handling)
+// BUILD v2.3.1 - 2025-12-05 - Fixed stream termination + typo fix
 
 // Types pour les requêtes
 interface SearchByAddressQuery {
@@ -56,7 +56,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
 
       try {
         // FIX: Utilise searchByAddressPostgis qui cherche dans proprietaires_geo (22M+ géocodés)
-        const { resultats, total_proprietaires, total_lots, debug } = await searchByAddressPostgis(adresse, departement, limit, codePostal);
+        const { resultats, total_proprietaires, total_lots, debug } = await searchByAddressPostgis(adresse, departement, limit, code_postal);
 
         return reply.send({
           success: true,
@@ -293,7 +293,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         writeAndFlush(JSON.stringify({ 
           type: 'start', 
           message: 'Recherche géographique PostGIS démarrée (streaming progressif)', 
-          build: 'v2.3.0-robust-stream', 
+          build: 'v2.3.1-robust-stream', 
           timestamp: new Date().toISOString() 
         }) + '\n');
 
