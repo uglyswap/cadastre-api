@@ -1,9 +1,9 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { searchByAddress, searchBySiren, searchByDenomination } from '../services/search.js';
-import { searchByPolygon, getGeoStats, searchByRadius } from '../services/geo-search-postgis.js';
+import { searchBySiren, searchByDenomination } from '../services/search.js';
+import { searchByPolygon, getGeoStats, searchByRadius, searchByAddressPostgis } from '../services/geo-search-postgis.js';
 import { authHook } from '../middleware/auth.js';
 
-// BUILD v2.0.1 - 2025-12-05 - Added debug output for polygon search
+// BUILD v2.1.0 - 2025-12-05 - Route /search/address now uses searchByAddressPostgis (proprietaires_geo table)
 
 // Types pour les requêtes
 interface SearchByAddressQuery {
@@ -38,7 +38,7 @@ interface SearchByRadiusBody {
 }
 
 export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
-  // Route: Recherche par adresse
+  // Route: Recherche par adresse - UTILISE MAINTENANT proprietaires_geo via searchByAddressPostgis
   fastify.get<{ Querystring: SearchByAddressQuery }>(
     '/search/address',
     { ...authHook },
@@ -55,7 +55,8 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       try {
-        const { resultats, total_proprietaires, total_lots } = await searchByAddress(adresse, departement, limit, code_postal);
+        // FIX: Utilise searchByAddressPostgis qui cherche dans proprietaires_geo (22M+ géocodés)
+        const { resultats, total_proprietaires, total_lots, debug } = await searchByAddressPostgis(adresse, departement, limit, code_postal);
 
         return reply.send({
           success: true,
@@ -73,6 +74,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           })),
           total_proprietaires,
           total_lots,
+          debug,
         });
       } catch (error) {
         console.error('Erreur recherche par adresse:', error);
@@ -248,7 +250,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         };
 
         // Envoyer un heartbeat initial immédiatement avec BUILD marker
-        writeAndFlush(JSON.stringify({ type: 'start', message: 'Recherche géographique PostGIS démarrée', build: 'v2.0.1-debug', timestamp: new Date().toISOString() }) + '\n');
+        writeAndFlush(JSON.stringify({ type: 'start', message: 'Recherche géographique PostGIS démarrée', build: 'v2.1.0-address-fix', timestamp: new Date().toISOString() }) + '\n');
 
         // Setup heartbeat interval to keep connection alive
         let heartbeatCount = 0;
