@@ -424,9 +424,26 @@ export async function searchByRadius(
     entreprise?: EntrepriseEnrichie;
     distance_metres: number;
   }>;
-  total: number;
+  total_proprietaires: number;
+  total_lots: number;
+  limites_appliquees: {
+    max_resultats: number;
+    max_enrichissement: number;
+  };
 }> {
+  const emptyResult = {
+    resultats: [],
+    total_proprietaires: 0,
+    total_lots: 0,
+    limites_appliquees: {
+      max_resultats: Math.min(limit, MAX_RESULTS),
+      max_enrichissement: MAX_ENRICHMENT,
+    },
+  };
+
   try {
+    const effectiveLimit = Math.min(limit, MAX_RESULTS);
+    
     const query = `
       SELECT 
         p.*,
@@ -440,7 +457,11 @@ export async function searchByRadius(
       LIMIT $4
     `;
 
-    const result = await pool.query(query, [lon, lat, radiusMeters, limit]);
+    const result = await pool.query(query, [lon, lat, radiusMeters, effectiveLimit]);
+
+    if (result.rows.length === 0) {
+      return emptyResult;
+    }
 
     // Grouper par propriétaire
     const proprietairesMap = new Map<string, {
@@ -470,12 +491,13 @@ export async function searchByRadius(
 
     const resultats = [];
     let enrichCount = 0;
+    let totalLots = 0;
 
     for (const [_, value] of proprietairesMap) {
       let entreprise: EntrepriseEnrichie | undefined;
       const sirens = Array.from(value.sirens);
 
-      if (sirens.length > 0 && sirens[0].length === 9 && enrichCount < 50) {
+      if (sirens.length > 0 && sirens[0].length === 9 && enrichCount < MAX_ENRICHMENT) {
         try {
           const enriched = await enrichSiren(sirens[0]);
           if (enriched) {
@@ -484,6 +506,8 @@ export async function searchByRadius(
           }
         } catch (e) {}
       }
+
+      totalLots += value.proprietes.length;
 
       resultats.push({
         proprietaire: value.proprietaire,
@@ -495,10 +519,15 @@ export async function searchByRadius(
 
     return {
       resultats,
-      total: resultats.length,
+      total_proprietaires: resultats.length,
+      total_lots: totalLots,
+      limites_appliquees: {
+        max_resultats: effectiveLimit,
+        max_enrichissement: MAX_ENRICHMENT,
+      },
     };
   } catch (error) {
     console.error('[geo-search-postgis] Erreur searchByRadius:', error);
-    return { resultats: [], total: 0 };
+    return emptyResult;
   }
 }
