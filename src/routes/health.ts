@@ -48,7 +48,7 @@ export async function healthRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.get('/', async (_request: FastifyRequest, reply: FastifyReply) => {
     return reply.send({
       name: 'Cadastre API',
-      version: '1.0.0',
+      version: '2.5.0-proprietairenet',
       description: 'API de recherche cadastrale avec enrichissement entreprises',
       endpoints: {
         'GET /health': 'Vérification de l\'état de l\'API',

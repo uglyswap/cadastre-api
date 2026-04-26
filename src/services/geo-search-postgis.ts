@@ -373,7 +373,7 @@ export async function searchByAddressPostgis(
 
     for (const raw of result.rows) {
       const propriete = transformToPropiete(raw);
-      const key = raw.siren || raw.denomination || 'inconnu';
+      const key = raw.siren || raw.denomination || `no-siren-${raw.id}`;
 
       if (!proprietairesMap.has(key)) {
         proprietairesMap.set(key, {
@@ -584,7 +584,7 @@ export async function searchByPolygonStreaming(
 
     for (const raw of result.rows) {
       const propriete = transformToPropiete(raw);
-      const key = raw.siren || raw.denomination || 'inconnu';
+      const key = raw.siren || raw.denomination || `no-siren-${raw.id}`;
 
       if (!proprietairesMap.has(key)) {
         proprietairesMap.set(key, {
@@ -806,7 +806,7 @@ export async function searchByPolygon(
 
     for (const raw of result.rows) {
       const propriete = transformToPropiete(raw);
-      const key = raw.siren || raw.denomination || 'inconnu';
+      const key = raw.siren || raw.denomination || `no-siren-${raw.id}`;
 
       if (!proprietairesMap.has(key)) {
         proprietairesMap.set(key, {
@@ -1036,7 +1036,7 @@ export async function searchByRadius(
 
     for (const raw of result.rows) {
       const propriete = transformToPropiete(raw);
-      const key = raw.siren || raw.denomination || 'inconnu';
+      const key = raw.siren || raw.denomination || `no-siren-${raw.id}`;
 
       if (!proprietairesMap.has(key)) {
         proprietairesMap.set(key, {

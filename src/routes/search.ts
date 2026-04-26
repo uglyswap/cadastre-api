@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { searchBySiren, searchByDenomination } from '../services/search.js';
 import { searchByPolygon, searchByPolygonStreaming, getGeoStats, searchByRadius, searchByAddressPostgis, ProprietaireResult } from '../services/geo-search-postgis.js';
+import { enrichParcelles } from '../services/enrichment.js';
 import { authHook } from '../middleware/auth.js';
 
 // BUILD v2.4.0 - 2025-12-05 - Unlimited enrichment for streaming mode
@@ -483,6 +484,56 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         });
       } catch (error) {
         console.error('Erreur stats géocodage:', error);
+        return reply.code(500).send({
+          success: false,
+          error: 'Erreur interne du serveur',
+          code: 'INTERNAL_ERROR',
+          details: error instanceof Error ? error.message : 'Erreur inconnue',
+        });
+      }
+    }
+  );
+
+  // Route: Enrichissement de parcelles (EVF/DVF, BDNB, Copro)
+  fastify.post(
+    '/search/enrich',
+    { ...authHook },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const { parcelles } = (request.body as any) || {};
+
+      if (!parcelles || !Array.isArray(parcelles) || parcelles.length === 0) {
+        return reply.code(400).send({
+          success: false,
+          error: 'Liste de parcelles requise',
+          code: 'MISSING_PARCELLES',
+          details: 'Le body doit contenir un champ "parcelles" (tableau de strings, format IDU 14 chars)',
+        });
+      }
+
+      if (parcelles.length > 200) {
+        return reply.code(400).send({
+          success: false,
+          error: 'Trop de parcelles',
+          code: 'TOO_MANY_PARCELLES',
+          details: 'Maximum 200 parcelles par requête',
+        });
+      }
+
+      try {
+        const enrichmentMap = await enrichParcelles(parcelles);
+        const results: Record<string, any> = {};
+        for (const [key, value] of enrichmentMap) {
+          results[key] = value;
+        }
+
+        return reply.send({
+          success: true,
+          enrichissement: results,
+          total: Object.keys(results).length,
+          parcelles_demandees: parcelles.length,
+        });
+      } catch (error) {
+        console.error('Erreur enrichissement:', error);
         return reply.code(500).send({
           success: false,
           error: 'Erreur interne du serveur',
