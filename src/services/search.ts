@@ -253,7 +253,9 @@ export async function searchByDenomination(
   total_lots: number;
 }> {
   const emptyResult = { resultats: [], total_proprietaires: 0, total_lots: 0 };
-  const maxResults = limit || config.search.maxLimit;
+  // Borne dure: un limit utilisateur ne peut jamais depasser maxLimit (anti-DoS memoire).
+  const requested = limit && limit > 0 ? limit : config.search.defaultLimit;
+  const maxResults = Math.min(requested, config.search.maxLimit);
 
   if (!denomination || denomination.trim().length < 2) {
     return emptyResult;

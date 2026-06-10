@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
-import { config } from './config/index.js';
+import { config, validateConfig } from './config/index.js';
 import { testConnection, closePool } from './services/database.js';
 import { searchRoutes } from './routes/search.js';
 import { healthRoutes } from './routes/health.js';
@@ -27,9 +27,14 @@ const fastify = Fastify({
 
 // Configuration
 async function setupServer() {
-  // CORS - permettre toutes les origines pour l'instant
+  // CORS - restreint aux origines configurees si CORS_ORIGINS est defini
+  // (liste separee par des virgules). A defaut, autorise toutes les origines
+  // (l'API est principalement consommee server-to-server avec X-API-Key).
+  const corsOrigins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+    : true;
   await fastify.register(cors, {
-    origin: true,
+    origin: corsOrigins,
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization'],
   });
@@ -55,9 +60,13 @@ async function setupServer() {
   fastify.setErrorHandler((error: Error & { statusCode?: number }, _request, reply) => {
     fastify.log.error(error.message);
 
-    reply.code(error.statusCode || 500).send({
+    const statusCode = error.statusCode || 500;
+    // Ne pas divulguer les details internes (messages SQL, chemins, etc.) sur une 5xx.
+    // Les erreurs client (4xx) restent explicites pour faciliter l'integration.
+    const isClientError = statusCode >= 400 && statusCode < 500;
+    reply.code(statusCode).send({
       success: false,
-      error: error.message || 'Erreur interne du serveur',
+      error: isClientError && error.message ? error.message : 'Erreur interne du serveur',
       code: 'INTERNAL_ERROR',
     });
   });
@@ -76,6 +85,9 @@ async function setupServer() {
 // Démarrer le serveur
 async function start() {
   try {
+    // Fail-closed: refuser de demarrer si un secret obligatoire manque
+    validateConfig();
+
     await setupServer();
 
     // Vérifier la connexion à la base de données (ne pas crasher si échec)

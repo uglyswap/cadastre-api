@@ -6,15 +6,19 @@
 import { Pool } from 'pg';
 
 // Pool dédié vers la base immo_data (enrichissement)
+// Aucun secret en dur: le mot de passe provient exclusivement de l'environnement.
 const enrichPool = new Pool({
   host: process.env.ENRICH_DB_HOST || '172.17.0.1',
   port: parseInt(process.env.ENRICH_DB_PORT || '5434'),
   database: 'immo_data',
   user: process.env.ENRICH_DB_USER || 'immo',
-  password: process.env.ENRICH_DB_PASSWORD || 'imm0_pr0d_2026_s3cure',
+  password: process.env.ENRICH_DB_PASSWORD || '',
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+});
+enrichPool.on('error', (err) => {
+  console.error('[ENRICH] Erreur pool immo_data (client idle):', err.message);
 });
 
 // Pool dédié vers la base cadastre_geo (surface parcelle)
@@ -23,10 +27,13 @@ const cadastrePool = new Pool({
   port: parseInt(process.env.CADASTRE_DB_PORT || '5434'),
   database: 'cadastre_geo',
   user: process.env.CADASTRE_DB_USER || 'immo',
-  password: process.env.CADASTRE_DB_PASSWORD || 'imm0_pr0d_2026_s3cure',
+  password: process.env.CADASTRE_DB_PASSWORD || '',
   max: 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+});
+cadastrePool.on('error', (err) => {
+  console.error('[ENRICH] Erreur pool cadastre_geo (client idle):', err.message);
 });
 
 /**

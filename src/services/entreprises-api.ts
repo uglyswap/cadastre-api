@@ -22,10 +22,14 @@ function getSirenePool(): Pool {
       port: parseInt(process.env.SIRENE_DB_PORT || '5434'),
       database: 'sirene',
       user: process.env.SIRENE_DB_USER || 'immo',
-      password: process.env.SIRENE_DB_PASSWORD || 'imm0_pr0d_2026_s3cure',
+      // Aucun secret en dur: mot de passe fourni uniquement par l'environnement.
+      password: process.env.SIRENE_DB_PASSWORD || '',
       max: 5,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 5000,
+    });
+    sirenePool.on('error', (err) => {
+      console.error('[SIRENE] Erreur pool (client idle):', err.message);
     });
   }
   return sirenePool;
@@ -64,8 +68,9 @@ class RateLimiter {
   }
 
   async waitForSlot(): Promise<void> {
+    let now = Date.now();
     while (true) {
-      const now = Date.now();
+      now = Date.now();
       this.timestamps = this.timestamps.filter(ts => now - ts < this.windowMs);
       if (this.timestamps.length < this.maxRequests) {
         break;

@@ -328,34 +328,53 @@ async function downloadBAN(): Promise<void> {
   }
 
   console.log('[BAN] Téléchargement depuis', BAN_URL);
-  
-  const response = await fetch(BAN_URL);
-  if (!response.ok) {
-    throw new Error(`Erreur téléchargement: ${response.status}`);
-  }
 
-  const totalSize = parseInt(response.headers.get('content-length') || '0');
-  const fileStream = fs.createWriteStream(GZ_FILE);
-  const reader = response.body?.getReader();
+  // Timeout global sur le telechargement: un fetch bloque ne doit pas figer
+  // l'import indefiniment (le fichier fait ~1.5 Go).
+  const controller = new AbortController();
+  const timeoutMs = parseInt(process.env.BAN_DOWNLOAD_TIMEOUT_MS || '1800000'); // 30 min
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!reader) throw new Error('Impossible de lire le stream');
-
-  let downloaded = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    fileStream.write(value);
-    downloaded += value.length;
-    importState.downloadProgress = Math.round((downloaded / totalSize) * 100);
-    
-    if (downloaded % 10000000 < value.length) { // Log tous les 10 Mo
-      console.log(`[BAN] Téléchargement: ${importState.downloadProgress}%`);
-      importEmitter.emit('progress', importState);
+  try {
+    const response = await fetch(BAN_URL, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`Erreur téléchargement: ${response.status}`);
     }
-  }
 
-  fileStream.close();
-  console.log('[BAN] Téléchargement terminé');
+    const totalSize = parseInt(response.headers.get('content-length') || '0');
+    const fileStream = fs.createWriteStream(GZ_FILE);
+    const reader = response.body?.getReader();
+
+    if (!reader) throw new Error('Impossible de lire le stream');
+
+    let downloaded = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      // Respecter la backpressure: attendre le drain si le buffer interne est plein,
+      // sinon un fichier de 1.5 Go peut saturer la memoire.
+      if (!fileStream.write(value)) {
+        await new Promise<void>((resolve) => fileStream.once('drain', resolve));
+      }
+      downloaded += value.length;
+      importState.downloadProgress = totalSize > 0 ? Math.round((downloaded / totalSize) * 100) : 0;
+
+      if (downloaded % 10000000 < value.length) { // Log tous les 10 Mo
+        console.log(`[BAN] Téléchargement: ${importState.downloadProgress}%`);
+        importEmitter.emit('progress', importState);
+      }
+    }
+
+    // Attendre que toutes les donnees soient ecrites sur disque avant de poursuivre,
+    // sinon la decompression peut lire un .gz incomplet.
+    await new Promise<void>((resolve, reject) => {
+      fileStream.end(() => resolve());
+      fileStream.on('error', reject);
+    });
+    console.log('[BAN] Téléchargement terminé');
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /**
@@ -484,8 +503,12 @@ async function insertBatch(records: BanRecord[]): Promise<number> {
     await pool.query(query, values);
     return placeholders.length;
   } catch (error) {
-    console.error('[BAN] Erreur batch:', error);
-    return 0;
+    // Ne pas avaler silencieusement l'echec: comptabiliser les lignes perdues et
+    // propager pour que l'import s'arrete proprement en statut 'error' plutot que
+    // de se terminer "avec succes" en ayant perdu des milliers de lignes.
+    console.error('[BAN] Erreur batch (lignes perdues:', placeholders.length, '):', error);
+    importState.errorCount += placeholders.length;
+    throw error instanceof Error ? error : new Error('Erreur insertion batch BAN');
   }
 }
 
@@ -559,15 +582,21 @@ export async function startBanImport(): Promise<{ success: boolean; message: str
     return { success: false, message: `Import déjà en cours (${importState.status})` };
   }
 
+  // Verrouiller le statut de maniere SYNCHRONE avant tout await: deux requetes
+  // concurrentes ne doivent pas franchir la garde ci-dessus toutes les deux et
+  // lancer deux imports paralleles (race TOCTOU).
+  importState.status = 'downloading';
+
   // Vérifier que la table existe
   const banTable = await checkBanTable();
   if (!banTable.exists) {
+    importState.status = 'idle'; // relacher le verrou pose plus haut
     return { success: false, message: 'Table BAN non créée. Appelez /admin/ban/setup d\'abord.' };
   }
 
   // Reset state
   importState = {
-    status: 'idle',
+    status: 'downloading',
     progress: 0,
     totalLines: 0,
     importedLines: 0,

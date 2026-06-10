@@ -3,6 +3,14 @@ import { searchBySiren, searchByDenomination } from '../services/search.js';
 import { searchByPolygon, searchByPolygonStreaming, getGeoStats, searchByRadius, searchByAddressPostgis, ProprietaireResult } from '../services/geo-search-postgis.js';
 import { enrichParcelles } from '../services/enrichment.js';
 import { authHook } from '../middleware/auth.js';
+import { config } from '../config/index.js';
+
+// Borne un limit utilisateur entre 1 et config.search.maxLimit (anti-DoS memoire),
+// y compris en mode streaming ou un limit absent retombe sur defaultLimit.
+function clampLimit(limit?: number): number {
+  const requested = typeof limit === 'number' && limit > 0 ? limit : config.search.defaultLimit;
+  return Math.min(requested, config.search.maxLimit);
+}
 
 // BUILD v2.4.0 - 2025-12-05 - Unlimited enrichment for streaming mode
 
@@ -57,7 +65,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
 
       try {
         // FIX: Utilise searchByAddressPostgis qui cherche dans proprietaires_geo (22M+ géocodés)
-        const { resultats, total_proprietaires, total_lots, debug } = await searchByAddressPostgis(adresse, departement, limit, code_postal);
+        const { resultats, total_proprietaires, total_lots, debug } = await searchByAddressPostgis(adresse, departement, clampLimit(limit), code_postal);
 
         return reply.send({
           success: true,
@@ -150,7 +158,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       try {
-        const { resultats, total_proprietaires, total_lots } = await searchByDenomination(denomination, departement, limit);
+        const { resultats, total_proprietaires, total_lots } = await searchByDenomination(denomination, departement, clampLimit(limit));
 
         return reply.send({
           success: true,
@@ -225,7 +233,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         });
       }
 
-      const effectiveLimit = limit || 10000;
+      const effectiveLimit = clampLimit(limit);
 
       // Mode streaming PROGRESSIF NDJSON - envoie chaque résultat dès qu'il est enrichi
       if (stream) {
