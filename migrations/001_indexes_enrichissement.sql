@@ -27,7 +27,9 @@
 --   idx_dvf_mutations_id_parcelle   ~600-900 Mo   ~8-15 min
 --   idx_dvf_mutations_id_mutation   ~500-800 Mo   ~8-15 min
 --   idx_copro_ref_1/2/3             ~15 Mo chacun ~10-30 s chacun
---   idx_prop_geo_idu_parts          ~1,2-1,6 Go   ~15-30 min
+--
+-- Les index BDNB necessaires existent deja : voir section 3. Ne rien y creer
+-- sans avoir compare les DEFINITIONS, IF NOT EXISTS ne comparant que les noms.
 --
 -- Prevoir 1,5 fois la taille de l'index en espace disque transitoire.
 -- Verifier l'espace libre AVANT de lancer :
@@ -82,16 +84,24 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_copro_ref_cadastrale_3
 
 
 -- -----------------------------------------------------------------------------
--- 3. bdnb : relation batiment <-> parcelle  (base immo_data)
+-- 3. bdnb : RIEN A CREER
 -- -----------------------------------------------------------------------------
--- ATTENTION : adapter le nom du schema au millesime reellement present.
---   SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'bdnb%';
--- Le code resout ce nom dynamiquement, mais un index doit nommer son schema.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bdnb_rel_bat_parcelle_parcelle_id
-  ON bdnb_2025_07_a_open_data.rel_batiment_groupe_parcelle (parcelle_id);
-
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bdnb_parcelle_parcelle_id
-  ON bdnb_2025_07_a_open_data.parcelle (parcelle_id);
+-- Les index dont l'enrichissement a besoin EXISTENT DEJA en production, sous
+-- d'autres noms que ceux qu'on aurait spontanement choisis :
+--
+--   idx_bdnb_parcelle_id   ON bdnb_<millesime>.parcelle (parcelle_id)
+--   idx_bdnb_rbp_parcelle  ON bdnb_<millesime>.rel_batiment_groupe_parcelle (parcelle_id)
+--   idx_bdnb_rbp_bg        ON bdnb_<millesime>.rel_batiment_groupe_parcelle (batiment_groupe_id)
+--
+-- Piege a connaitre : `CREATE INDEX IF NOT EXISTS` ne compare que le NOM de
+-- l'index, jamais sa definition. Creer les memes colonnes sous un nom different
+-- aurait donc reussi sans avertissement, et produit des index en double :
+-- plusieurs gigaoctets de disque et plusieurs heures d'ecriture pour aucun gain,
+-- sur des tables de 93 et 32 millions de lignes.
+--
+-- Verifier avant toute creation sur ces schemas :
+--   SELECT indexname, indexdef FROM pg_indexes
+--    WHERE schemaname LIKE 'bdnb%' AND indexdef LIKE '%parcelle_id%';
 
 
 -- -----------------------------------------------------------------------------
@@ -147,5 +157,3 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bdnb_parcelle_parcelle_id
 -- DROP INDEX CONCURRENTLY IF EXISTS copro.idx_copro_ref_cadastrale_1;
 -- DROP INDEX CONCURRENTLY IF EXISTS copro.idx_copro_ref_cadastrale_2;
 -- DROP INDEX CONCURRENTLY IF EXISTS copro.idx_copro_ref_cadastrale_3;
--- DROP INDEX CONCURRENTLY IF EXISTS bdnb_2025_07_a_open_data.idx_bdnb_rel_bat_parcelle_parcelle_id;
--- DROP INDEX CONCURRENTLY IF EXISTS bdnb_2025_07_a_open_data.idx_bdnb_parcelle_parcelle_id;

@@ -55,6 +55,8 @@ export interface VenteDVF {
   nombre_lots: number | null;
   nombre_pieces: number | null;
   nature_culture: string | null;
+  /** Somme des surfaces Carrez des lots vendus, en m2. */
+  surface_lots_carrez_m2: number | null;
   foncier_nu: boolean;
   parcelles_connues_dans_mutation: number;
   prix_couvre_plusieurs_parcelles: boolean;
@@ -69,6 +71,8 @@ export interface ParcelleEnrichment {
   ventes: VenteDVF[];
   nb_transactions: number;
   premiere_transaction: string | null;
+  /** Surface Carrez de la derniere vente, en m2. */
+  surface_lots_carrez: number | null;
   type_bien: string | null;
   annee_construction: number | null;
   nb_niveaux: number | null;

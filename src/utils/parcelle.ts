@@ -7,26 +7,33 @@
  *   - bdnb_<millesime>.rel_batiment_groupe_parcelle.parcelle_id
  *   - dvf.mutations.id_parcelle                    text
  *
- * Composition : code_departement + code_commune(3) + prefixe(3) + section(2) + numero(4)
+ * Composition : code_departement + code_commune + prefixe(3) + section(2) + numero(4)
  *
- * En metropole le code departement tient sur 2 caracteres, l'IDU fait donc 14
- * caracteres. Dans les DOM il tient sur 3 caracteres (971 a 976) et l'IDU fait
- * 15 caracteres. `parcelles_cadastre.idu` etant en varchar(20) accepte les deux,
- * mais `bdnb.parcelle.parcelle_id` est en varchar(14) et son
- * `code_departement_insee` en varchar(2) : la BDNB ne peut structurellement pas
- * porter de parcelle d'outre-mer. On expose donc les deux longueurs et on laisse
- * l'appelant savoir quelles sources sont interrogeables (cf. isDomIdu).
+ * L'IDU fait TOUJOURS 14 caracteres. Le code INSEE d'une commune en fait 5, qui
+ * se repartissent differemment selon le territoire :
+ *   - metropole  : departement sur 2, commune sur 3  ('75'  + '056')
+ *   - outre-mer  : departement sur 3, commune sur 2  ('971' + '01')
+ *
+ * Padder la commune sur 3 dans les deux cas produisait un IDU de 15 caracteres
+ * en outre-mer, qui ne correspondait a aucune ligne d'aucun referentiel.
+ *
+ * `bdnb.parcelle.code_departement_insee` est en varchar(2) et ne peut pas porter
+ * '971' : l'enrichissement batiment est donc indisponible outre-mer, sans que ce
+ * soit une erreur (cf. isDomIdu). Les ventes DVF et la contenance cadastrale y
+ * restent accessibles.
  *
  * Cette fonction remplace la reconstruction qui vivait cote frontend
  * (app/api/cadastre/search/route.ts) : le backend est le seul endroit qui
  * connait le format des colonnes sources, c'est donc a lui de produire la cle.
  */
 
-/** Longueur d'un IDU metropolitain. */
-export const IDU_LENGTH_METROPOLE = 14;
-
-/** Longueur d'un IDU d'outre-mer (departement sur 3 caracteres). */
-export const IDU_LENGTH_DOM = 15;
+/**
+ * Longueur d'un IDU, invariable.
+ *
+ * 14 caracteres en metropole comme en outre-mer : le departement gagne un
+ * caractere outre-mer (971) mais la commune en perd un (01 au lieu de 056).
+ */
+export const IDU_LENGTH = 14;
 
 export interface IduParts {
   departement: string;
@@ -76,15 +83,25 @@ export function buildIdu(parts: IduParts): string | null {
   // Ces trois composantes ne peuvent pas etre devinees.
   if (!codeCommune || !section || !numero) return null;
 
-  // Le code commune est sur 3 caracteres. Certaines sources le stockent deja
-  // concatene au departement (5 caracteres, code INSEE complet) : on retire
-  // alors le prefixe departement pour ne pas le compter deux fois.
+  // L'IDU fait TOUJOURS 14 caracteres, y compris en outre-mer.
+  //
+  // Le code INSEE d'une commune fait 5 caracteres. En metropole il se decompose
+  // en departement sur 2 et commune sur 3 ('75' + '056'). En outre-mer le
+  // departement occupe 3 caracteres et la commune n'en occupe donc plus que 2
+  // ('971' + '01'). Padder la commune sur 3 dans les deux cas produisait un IDU
+  // de 15 caracteres pour les DOM, qui ne correspondait a aucune ligne des
+  // referentiels : ni dvf.mutations.id_parcelle, ni bdnb.parcelle.parcelle_id
+  // (varchar(14)), ni parcelles_cadastre.idu.
+  const longueurCommune = departement.length === 3 ? 2 : 3;
+
   let commune = codeCommune;
+  // Certaines sources stockent deja le code INSEE complet sur 5 caracteres :
+  // on retire alors le prefixe departement pour ne pas le compter deux fois.
   if (commune.length === 5 && commune.startsWith(departement)) {
     commune = commune.slice(departement.length);
   }
-  if (commune.length > 3) return null;
-  commune = commune.padStart(3, '0');
+  if (commune.length > longueurCommune) return null;
+  commune = commune.padStart(longueurCommune, '0');
 
   // Le prefixe (ex-commune absorbee) vaut '000' quand il n'y en a pas.
   const rawPrefixe = (parts.prefixe || '').trim();
@@ -100,7 +117,9 @@ export function buildIdu(parts: IduParts): string | null {
   const idu = `${departement}${commune}${prefixe}${sectionPadded}${numeroPadded}`;
 
   // Garde-fou : toute longueur inattendue signale une donnee source hors format.
-  if (idu.length !== IDU_LENGTH_METROPOLE && idu.length !== IDU_LENGTH_DOM) {
+  // Mieux vaut ne pas enrichir que d'apparier silencieusement la mauvaise
+  // parcelle, ce qui afficherait un prix de vente faux comme s'il etait certain.
+  if (idu.length !== IDU_LENGTH) {
     return null;
   }
 
@@ -109,12 +128,14 @@ export function buildIdu(parts: IduParts): string | null {
 
 /**
  * True si l'IDU designe une parcelle d'outre-mer.
- * Les tables BDNB (parcelle_id varchar(14), code_departement_insee varchar(2))
- * ne peuvent pas contenir ces parcelles : l'enrichissement batiment et surface
- * geometrique est donc indisponible, sans que ce soit une erreur.
+ *
+ * `bdnb.parcelle.code_departement_insee` est en varchar(2) et ne peut donc pas
+ * porter '971' : l'enrichissement batiment et surface geometrique est
+ * indisponible pour ces parcelles, sans que ce soit une erreur. Les ventes DVF
+ * et la contenance cadastrale, elles, restent disponibles.
  */
 export function isDomIdu(idu: string): boolean {
-  return idu.length === IDU_LENGTH_DOM;
+  return /^9[78]/.test(idu);
 }
 
 /**
@@ -122,16 +143,18 @@ export function isDomIdu(idu: string): boolean {
  * lisible par un humain a partir de la seule cle.
  */
 export function parseIdu(idu: string): IduParts | null {
-  if (idu.length !== IDU_LENGTH_METROPOLE && idu.length !== IDU_LENGTH_DOM) {
-    return null;
-  }
-  const depLength = idu.length === IDU_LENGTH_DOM ? 3 : 2;
+  if (idu.length !== IDU_LENGTH) return null;
+
+  // Outre-mer : departement sur 3, commune sur 2. Metropole : 2 et 3.
+  const depLength = /^9[78]/.test(idu) ? 3 : 2;
+  const communeLength = depLength === 3 ? 2 : 3;
+
   return {
     departement: idu.slice(0, depLength),
-    code_commune: idu.slice(depLength, depLength + 3),
-    prefixe: idu.slice(depLength + 3, depLength + 6),
-    section: idu.slice(depLength + 6, depLength + 8),
-    numero_plan: idu.slice(depLength + 8),
+    code_commune: idu.slice(depLength, depLength + communeLength),
+    prefixe: idu.slice(depLength + communeLength, depLength + communeLength + 3),
+    section: idu.slice(depLength + communeLength + 3, depLength + communeLength + 5),
+    numero_plan: idu.slice(depLength + communeLength + 5),
   };
 }
 

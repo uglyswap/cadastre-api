@@ -200,6 +200,7 @@ function emptyEnrichment(idu: string): ParcelleEnrichment {
     ventes: [],
     nb_transactions: 0,
     premiere_transaction: null,
+    surface_lots_carrez: null,
     type_bien: null,
     annee_construction: null,
     nb_niveaux: null,
@@ -228,62 +229,125 @@ function emptyEnrichment(idu: string): ParcelleEnrichment {
  * La fenetre `ROW_NUMBER` classe les mutations de chaque parcelle par date
  * decroissante : la ligne rn = 1 est la derniere vente enregistree.
  */
-async function queryDvf(idus: string[]): Promise<Map<string, VenteDVF[]>> {
+interface TotauxDvf {
+  nbTransactions: number;
+  premiereTransaction: string | null;
+}
+
+async function queryDvf(
+  idus: string[]
+): Promise<{ ventes: Map<string, VenteDVF[]>; totaux: Map<string, TotauxDvf> }> {
   const sql = `
-    WITH mut_parcelle AS (
+    WITH
+    -- Les lignes DVF d'une meme (mutation, parcelle) decrivent chacune un local
+    -- ou une subdivision de culture, et repetent la valeur fonciere de la
+    -- mutation entiere. On ne peut donc ni sommer valeur_fonciere, ni sommer
+    -- naivement surface_terrain qui est elle aussi repetee.
+    --
+    -- surface_terrain est deduplique sur (nature de culture, surface) avant
+    -- sommation : sommer les lignes brutes gonflerait la surface autant de fois
+    -- qu'il y a de locaux, et en prendre le seul maximum perdrait les parcelles
+    -- reellement subdivisees en plusieurs natures de culture.
+    terrain_dedup AS (
+      SELECT DISTINCT
+        m.id_parcelle,
+        m.id_mutation,
+        COALESCE(m.code_nature_culture, '')       AS code_nature_culture,
+        COALESCE(m.surface_terrain, 0)            AS surface_terrain
+      FROM dvf.mutations m
+      WHERE m.id_parcelle = ANY($1::text[])
+        AND m.valeur_fonciere > 0
+    ),
+    terrain_par_mutation AS (
+      SELECT id_parcelle, id_mutation, SUM(surface_terrain) AS surface_terrain
+        FROM terrain_dedup
+       GROUP BY id_parcelle, id_mutation
+    ),
+    mut_parcelle AS (
       SELECT
         m.id_parcelle,
         m.id_mutation,
         MAX(m.date_mutation)                            AS date_mutation,
         MAX(m.nature_mutation)                          AS nature_mutation,
+        -- Valeur de la mutation : identique sur toutes ses lignes, MAX la releve
+        -- sans jamais la cumuler.
         MAX(m.valeur_fonciere)                          AS valeur_fonciere,
+        -- Le bati, lui, est bien propre a chaque local : il se somme.
         SUM(COALESCE(m.surface_reelle_bati, 0))         AS surface_bati,
-        MAX(COALESCE(m.surface_terrain, 0))             AS surface_terrain,
         MAX(m.type_local)                               AS type_local,
         MAX(m.nombre_lots)                              AS nombre_lots,
         SUM(COALESCE(m.nombre_pieces_principales, 0))   AS nombre_pieces,
-        MAX(m.nature_culture)                           AS nature_culture
+        MAX(m.nature_culture)                           AS nature_culture,
+        -- Surface Carrez : chaque ligne porte jusqu'a 5 lots, propres au local.
+        SUM(
+          COALESCE(m.lot1_surface_carrez, 0) + COALESCE(m.lot2_surface_carrez, 0) +
+          COALESCE(m.lot3_surface_carrez, 0) + COALESCE(m.lot4_surface_carrez, 0) +
+          COALESCE(m.lot5_surface_carrez, 0)
+        )                                               AS surface_lots_carrez
       FROM dvf.mutations m
       WHERE m.id_parcelle = ANY($1::text[])
         AND m.valeur_fonciere > 0
       GROUP BY m.id_parcelle, m.id_mutation
     ),
-    spread AS (
-      SELECT id_mutation, COUNT(DISTINCT id_parcelle) AS parcelles_connues
-      FROM mut_parcelle
-      GROUP BY id_mutation
+    -- Nombre REEL de parcelles couvertes par chaque mutation, calcule sur la
+    -- table entiere et non sur le seul lot interroge.
+    --
+    -- Le compter dans le lot rendait le resultat dependant de la requete : la
+    -- meme parcelle affichait un prix au m2 tantot present, tantot absent, selon
+    -- que la parcelle voisine figurait ou non dans la recherche. S'appuie sur
+    -- idx_dvf_mutations_id_mutation (migrations/001).
+    portee_reelle AS (
+      SELECT m.id_mutation, COUNT(DISTINCT m.id_parcelle) AS parcelles_totales
+        FROM dvf.mutations m
+       WHERE m.id_mutation IN (SELECT DISTINCT id_mutation FROM mut_parcelle)
+         AND m.valeur_fonciere > 0
+       GROUP BY m.id_mutation
     ),
-    ranked AS (
+    complet AS (
       SELECT
         mp.*,
-        s.parcelles_connues,
+        COALESCE(t.surface_terrain, 0)          AS surface_terrain,
+        COALESCE(p.parcelles_totales, 1)        AS parcelles_totales,
+        -- Comptages calcules sur l'historique COMPLET, avant toute troncature :
+        -- les deduire des seules lignes retournees sous-estimait le nombre de
+        -- transactions et faussait la date de premiere transaction.
+        COUNT(*)          OVER (PARTITION BY mp.id_parcelle) AS nb_transactions_total,
+        MIN(mp.date_mutation) OVER (PARTITION BY mp.id_parcelle) AS premiere_transaction,
         ROW_NUMBER() OVER (
           PARTITION BY mp.id_parcelle
-          ORDER BY mp.date_mutation DESC, mp.valeur_fonciere DESC
+          -- id_mutation en dernier critere : sans lui, deux mutations de meme
+          -- date et de meme valeur s'ordonnaient de facon non deterministe et
+          -- la "derniere vente" pouvait changer d'un appel a l'autre.
+          ORDER BY mp.date_mutation DESC, mp.valeur_fonciere DESC, mp.id_mutation DESC
         ) AS rn
       FROM mut_parcelle mp
-      JOIN spread s ON s.id_mutation = mp.id_mutation
+      LEFT JOIN terrain_par_mutation t
+        ON t.id_parcelle = mp.id_parcelle AND t.id_mutation = mp.id_mutation
+      LEFT JOIN portee_reelle p
+        ON p.id_mutation = mp.id_mutation
     )
     SELECT *
-      FROM ranked
+      FROM complet
      WHERE rn <= $2
      ORDER BY id_parcelle, rn
   `;
 
   const res = await getEnrichPool().query(sql, [idus, MAX_VENTES_HISTORIQUE]);
   const byParcelle = new Map<string, VenteDVF[]>();
+  const totauxParParcelle = new Map<string, TotauxDvf>();
 
   for (const row of res.rows) {
     const surfaceBati = toNumber(row.surface_bati) || 0;
     const surfaceTerrain = toNumber(row.surface_terrain) || 0;
     const valeur = toNumber(row.valeur_fonciere) || 0;
-    const parcellesConnues = toInt(row.parcelles_connues) || 1;
+    const parcellesTotales = toInt(row.parcelles_totales) || 1;
     const fonciernu = surfaceBati <= 0 && surfaceTerrain > 0;
 
     // Le prix au m2 n'a de sens que rapporte a une surface, et seulement si la
-    // mutation ne couvre pas plusieurs parcelles (sinon on imputerait a une
-    // parcelle le prix de plusieurs).
-    const imputable = parcellesConnues <= 1;
+    // mutation ne couvre qu'une parcelle : sinon on imputerait a celle-ci le
+    // prix de plusieurs. Le comptage est desormais calcule sur la table entiere,
+    // il ne depend plus de la composition du lot interroge.
+    const imputable = parcellesTotales <= 1;
 
     const vente: VenteDVF = {
       id_mutation: String(row.id_mutation),
@@ -304,17 +368,30 @@ async function queryDvf(idus: string[]): Promise<Map<string, VenteDVF[]>> {
       nombre_lots: toInt(row.nombre_lots),
       nombre_pieces: toInt(row.nombre_pieces) || null,
       nature_culture: row.nature_culture || null,
+      surface_lots_carrez_m2: (toNumber(row.surface_lots_carrez) || 0) > 0
+        ? Math.round(toNumber(row.surface_lots_carrez) as number)
+        : null,
       foncier_nu: fonciernu,
-      parcelles_connues_dans_mutation: parcellesConnues,
-      prix_couvre_plusieurs_parcelles: parcellesConnues > 1,
+      parcelles_connues_dans_mutation: parcellesTotales,
+      prix_couvre_plusieurs_parcelles: parcellesTotales > 1,
     };
 
     const list = byParcelle.get(row.id_parcelle) || [];
     list.push(vente);
     byParcelle.set(row.id_parcelle, list);
+
+    // Totaux calcules sur l'historique complet, avant troncature.
+    totauxParParcelle.set(row.id_parcelle, {
+      nbTransactions: toInt(row.nb_transactions_total) || list.length,
+      premiereTransaction: row.premiere_transaction instanceof Date
+        ? row.premiere_transaction.toISOString().slice(0, 10)
+        : row.premiere_transaction
+          ? String(row.premiere_transaction).slice(0, 10)
+          : null,
+    });
   }
 
-  return byParcelle;
+  return { ventes: byParcelle, totaux: totauxParParcelle };
 }
 
 /** Caracteristiques du bati et surface geometrique (BDNB). */
@@ -379,6 +456,9 @@ async function queryBdnb(idus: string[]): Promise<Map<string, Record<string, unk
  */
 async function queryCopro(idus: string[]): Promise<Map<string, Record<string, unknown>>> {
   const sql = `
+    -- DISTINCT ON exige un ORDER BY pour etre deterministe : sans lui, la
+    -- copropriete retenue pour une parcelle changeait d'un appel a l'autre.
+    -- On privilegie la fiche la plus renseignee, puis le nom, comme cle stable.
     SELECT DISTINCT ON (parcelle_id) *
     FROM (
       SELECT reference_cadastrale_1 AS parcelle_id, nom_d_usage_de_la_copropriete,
@@ -397,6 +477,9 @@ async function queryCopro(idus: string[]): Promise<Map<string, Record<string, un
         FROM copro.coproprietes WHERE reference_cadastrale_3 = ANY($1::text[])
     ) t
     WHERE parcelle_id IS NOT NULL
+    ORDER BY parcelle_id,
+             (nombre_total_de_lots IS NOT NULL) DESC,
+             nom_d_usage_de_la_copropriete NULLS LAST
   `;
 
   const res = await getEnrichPool().query(sql, [idus]);
@@ -456,15 +539,19 @@ export async function enrichParcellesDetailed(
 
   // --- DVF : ventes et dernier prix -----------------------------------------
   if (dvfRes.status === 'fulfilled') {
-    for (const [idu, ventes] of dvfRes.value) {
+    for (const [idu, ventes] of dvfRes.value.ventes) {
       const entry = results.get(idu);
       if (!entry) continue;
+      const totaux = dvfRes.value.totaux.get(idu);
       entry.ventes = ventes;
       entry.derniere_vente = ventes[0] || null;
-      entry.nb_transactions = ventes.length;
-      entry.premiere_transaction = ventes.length
-        ? ventes[ventes.length - 1].date_mutation
-        : null;
+      // Comptages issus de l'historique complet, et non des seules ventes
+      // retournees : l'historique est tronque a MAX_VENTES_HISTORIQUE.
+      entry.nb_transactions = totaux?.nbTransactions ?? ventes.length;
+      entry.premiere_transaction =
+        totaux?.premiereTransaction ??
+        (ventes.length ? ventes[ventes.length - 1].date_mutation : null);
+      entry.surface_lots_carrez = ventes[0]?.surface_lots_carrez_m2 ?? null;
       entry.foncier_nu = ventes.length > 0 && ventes.every((v) => v.foncier_nu);
       entry.sources.dvf = true;
     }
