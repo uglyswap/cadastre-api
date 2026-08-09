@@ -8,14 +8,14 @@ import {
   createIndexes,
 } from '../services/ban-setup.js';
 import { getBanStats } from '../services/geo-search.js';
-import { authHook } from '../middleware/auth.js';
+import { adminAuthHook } from '../middleware/auth.js';
 
 export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
   
   // Vérifier l'état du système BAN
   fastify.get(
     '/admin/ban/status',
-    { ...authHook },
+    { ...adminAuthHook },
     async (_request: FastifyRequest, reply: FastifyReply) => {
       try {
         const postgis = await checkPostGIS();
@@ -56,7 +56,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
   // Setup: installer PostGIS et créer la table BAN
   fastify.post(
     '/admin/ban/setup',
-    { ...authHook },
+    { ...adminAuthHook },
     async (_request: FastifyRequest, reply: FastifyReply) => {
       try {
         console.log('[Admin] Démarrage setup BAN...');
@@ -90,7 +90,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
   // Import: télécharger et importer la BAN (en arrière-plan)
   fastify.post(
     '/admin/ban/import',
-    { ...authHook },
+    { ...adminAuthHook },
     async (_request: FastifyRequest, reply: FastifyReply) => {
       try {
         console.log('[Admin] Démarrage import BAN...');
@@ -123,7 +123,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
   // Recréer les index (après import)
   fastify.post(
     '/admin/ban/reindex',
-    { ...authHook },
+    { ...adminAuthHook },
     async (_request: FastifyRequest, reply: FastifyReply) => {
       try {
         console.log('[Admin] Recréation des index BAN...');
@@ -147,7 +147,7 @@ export async function adminRoutes(fastify: FastifyInstance): Promise<void> {
   // Stats BAN (raccourci)
   fastify.get(
     '/admin/ban/stats',
-    { ...authHook },
+    { ...adminAuthHook },
     async (_request: FastifyRequest, reply: FastifyReply) => {
       try {
         const stats = await getBanStats();

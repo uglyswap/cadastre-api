@@ -40,13 +40,84 @@ export interface Adresse {
   longitude?: number;
 }
 
+/** Une mutation DVF, c'est-a-dire une vente enregistree par l'administration. */
+export interface VenteDVF {
+  id_mutation: string;
+  date_mutation: string;
+  nature_mutation: string | null;
+  /** Prix total enregistre pour la mutation, en euros. */
+  valeur_fonciere: number;
+  surface_bati_m2: number | null;
+  surface_terrain_m2: number | null;
+  prix_m2_bati: number | null;
+  prix_m2_terrain: number | null;
+  type_local: string | null;
+  nombre_lots: number | null;
+  nombre_pieces: number | null;
+  nature_culture: string | null;
+  foncier_nu: boolean;
+  parcelles_connues_dans_mutation: number;
+  prix_couvre_plusieurs_parcelles: boolean;
+}
+
+/** Donnees agregees d'une parcelle : cadastre, ventes, bati, copropriete. */
+export interface ParcelleEnrichment {
+  idu: string;
+  surface_parcelle_m2: number | null;
+  surface_geometrique_m2: number | null;
+  derniere_vente: VenteDVF | null;
+  ventes: VenteDVF[];
+  nb_transactions: number;
+  premiere_transaction: string | null;
+  type_bien: string | null;
+  annee_construction: number | null;
+  nb_niveaux: number | null;
+  nb_logements: number | null;
+  materiau_mur: string | null;
+  materiau_toit: string | null;
+  est_copropriete: boolean;
+  nom_copropriete: string | null;
+  nb_lots_total: number | null;
+  nb_lots_habitation: number | null;
+  nb_lots_tertiaire: number | null;
+  nb_lots_stationnement: number | null;
+  periode_construction: string | null;
+  foncier_nu: boolean;
+  sources: {
+    dvf: boolean;
+    bdnb: boolean;
+    copro: boolean;
+    cadastre: boolean;
+  };
+}
+
 export interface ReferenceCadastrale {
   departement: string;
   code_commune: string;
   prefixe: string | null;
   section: string;
   numero_plan: string;
+  /**
+   * Reference lisible, jointe par des tirets. Longueur variable : ne JAMAIS
+   * l'utiliser comme cle de jointure, elle n'est compatible avec aucune colonne
+   * des referentiels. Utiliser `idu`.
+   */
   reference_complete: string;
+  /**
+   * Identifiant unique de parcelle, 14 caracteres en metropole et 15 en
+   * outre-mer. C'est la seule cle qui joint dvf.mutations.id_parcelle,
+   * bdnb.parcelle.parcelle_id et parcelles_cadastre.idu.
+   * null quand les composantes sources sont incompletes.
+   */
+  idu: string | null;
+  /** Contenance cadastrale en m2, telle que portee par proprietaires_geo. */
+  contenance_m2: number | null;
+  /**
+   * Donnees de la parcelle : ventes DVF, bati, copropriete.
+   * Renseigne par les routes de recherche quand l'enrichissement est actif,
+   * null quand la parcelle est inconnue des referentiels.
+   */
+  enrichissement?: ParcelleEnrichment | null;
 }
 
 export interface LocalisationLocal {

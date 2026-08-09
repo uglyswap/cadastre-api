@@ -1,9 +1,94 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { searchBySiren, searchByDenomination } from '../services/search.js';
 import { searchByPolygon, searchByPolygonStreaming, getGeoStats, searchByRadius, searchByAddressPostgis, ProprietaireResult } from '../services/geo-search-postgis.js';
-import { enrichParcelles } from '../services/enrichment.js';
 import { authHook } from '../middleware/auth.js';
 import { config } from '../config/index.js';
+import {
+  enrichParcelles,
+  enrichParcellesDetailed,
+  ParcelleEnrichment,
+  MAX_PARCELLES_PAR_APPEL,
+} from '../services/enrichment.js';
+import { ProprieteGroupee } from '../types/index.js';
+import { sendServerError } from '../utils/api-error.js';
+import { randomUUID } from 'node:crypto';
+
+/**
+ * Attache les donnees de parcelle et l'historique des ventes aux resultats
+ * d'une recherche.
+ *
+ * Jusqu'ici les resultats de recherche ne portaient AUCUNE donnee de parcelle :
+ * l'enrichissement n'existait que sur une route separee que l'appelant devait
+ * penser a interroger dans un second temps, avec une cle qu'il devait
+ * reconstruire lui-meme. Le prix de la derniere vente etait de surcroit calcule
+ * puis jete avant d'etre renvoye.
+ *
+ * L'enrichissement est attache a DEUX niveaux :
+ *   - sur chaque reference cadastrale, la donnee de SA parcelle ;
+ *   - au niveau du resultat, un resume portant sur la parcelle la plus
+ *     significative, pour l'affichage en liste.
+ */
+/**
+ * Choisit la parcelle representative d'un proprietaire : celle dont la vente
+ * est la plus recente, a defaut la plus grande. Prendre la premiere du tableau,
+ * comme le faisait l'appelant precedent, retenait une parcelle arbitraire.
+ */
+function choisirParcellePrincipale(
+  candidates: ParcelleEnrichment[]
+): ParcelleEnrichment | null {
+  if (candidates.length === 0) return null;
+  return candidates.reduce((best, current) => {
+    const bestDate = best.derniere_vente?.date_mutation || '';
+    const currentDate = current.derniere_vente?.date_mutation || '';
+    if (currentDate !== bestDate) return currentDate > bestDate ? current : best;
+    const bestSurface = best.surface_parcelle_m2 || 0;
+    const currentSurface = current.surface_parcelle_m2 || 0;
+    return currentSurface > bestSurface ? current : best;
+  });
+}
+
+async function attachEnrichment(
+  resultats: Array<{ proprietes?: ProprieteGroupee[]; enrichissement?: ParcelleEnrichment | null }>
+): Promise<{ parcelles_enrichies: number; sources_en_echec: string[] }> {
+  const idus: string[] = [];
+  for (const resultat of resultats) {
+    for (const propriete of resultat.proprietes || []) {
+      for (const reference of propriete.references_cadastrales || []) {
+        if (reference.idu) idus.push(reference.idu);
+      }
+    }
+  }
+
+  const uniques = [...new Set(idus)];
+  if (uniques.length === 0) {
+    return { parcelles_enrichies: 0, sources_en_echec: [] };
+  }
+
+  // Plafond de securite : au-dela, on enrichit les premieres parcelles plutot
+  // que de faire tomber la recherche entiere. Le plafond est signale a
+  // l'appelant par `parcelles_enrichies` inferieur au nombre de references.
+  const lot = uniques.slice(0, MAX_PARCELLES_PAR_APPEL);
+  const { results, failures } = await enrichParcellesDetailed(lot);
+
+  for (const resultat of resultats) {
+    const candidates: ParcelleEnrichment[] = [];
+    for (const propriete of resultat.proprietes || []) {
+      for (const reference of propriete.references_cadastrales || []) {
+        const data = reference.idu ? results.get(reference.idu) : undefined;
+        reference.enrichissement = data || null;
+        if (data) candidates.push(data);
+      }
+    }
+    resultat.enrichissement = choisirParcellePrincipale(candidates);
+  }
+
+  return { parcelles_enrichies: results.size, sources_en_echec: failures };
+}
+
+/** L'enrichissement est actif par defaut et desactivable par `enrich=false`. */
+function wantsEnrichment(value: unknown): boolean {
+  return !(value === false || value === 'false' || value === '0');
+}
 
 // Borne un limit utilisateur entre 1 et config.search.maxLimit (anti-DoS memoire),
 // y compris en mode streaming ou un limit absent retombe sur defaultLimit.
@@ -20,23 +105,33 @@ interface SearchByAddressQuery {
   departement?: string;
   code_postal?: string;
   limit?: number;
+  /** Enrichissement parcelle + ventes DVF. Actif par defaut. */
+  enrich?: string | boolean;
 }
 
 interface SearchBySirenQuery {
   siren: string;
   departement?: string;
+  enrich?: string | boolean;
 }
 
 interface SearchByDenominationQuery {
   denomination: string;
   departement?: string;
   limit?: number;
+  enrich?: string | boolean;
 }
 
 interface SearchByPolygonBody {
   polygon: number[][];
   limit?: number;
   stream?: boolean;
+  /**
+   * Enrichissement parcelle + ventes. Actif par defaut en mode batch.
+   * Ignore en mode streaming : il faudrait une requete par proprietaire, ce qui
+   * serialiserait des centaines d'allers-retours base pendant le flux.
+   */
+  enrich?: string | boolean;
 }
 
 interface SearchByRadiusBody {
@@ -44,6 +139,7 @@ interface SearchByRadiusBody {
   latitude: number;
   radius_meters: number;
   limit?: number;
+  enrich?: string | boolean;
 }
 
 export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
@@ -67,6 +163,18 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         // FIX: Utilise searchByAddressPostgis qui cherche dans proprietaires_geo (22M+ géocodés)
         const { resultats, total_proprietaires, total_lots, debug } = await searchByAddressPostgis(adresse, departement, clampLimit(limit), code_postal);
 
+        const payload = resultats.map(r => ({
+          proprietaire: r.proprietaire,
+          entreprise: r.entreprise,
+          proprietes: r.proprietes,
+          nombre_adresses: r.nombre_adresses,
+          nombre_lots: r.nombre_lots,
+        }));
+
+        const enrichissement = wantsEnrichment(request.query.enrich)
+          ? await attachEnrichment(payload)
+          : null;
+
         return reply.send({
           success: true,
           query: {
@@ -74,25 +182,14 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
             departement: departement || null,
             code_postal: code_postal || null,
           },
-          resultats: resultats.map(r => ({
-            proprietaire: r.proprietaire,
-            entreprise: r.entreprise,
-            proprietes: r.proprietes,
-            nombre_adresses: r.nombre_adresses,
-            nombre_lots: r.nombre_lots,
-          })),
+          resultats: payload,
           total_proprietaires,
           total_lots,
+          enrichissement,
           debug,
         });
       } catch (error) {
-        console.error('Erreur recherche par adresse:', error);
-        return reply.code(500).send({
-          success: false,
-          error: 'Erreur interne du serveur',
-          code: 'INTERNAL_ERROR',
-          details: error instanceof Error ? error.message : 'Erreur inconnue',
-        });
+        return sendServerError(reply, 'recherche par adresse', error);
       }
     }
   );
@@ -116,12 +213,18 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       try {
         const result = await searchBySiren(siren, departement);
 
+        const enveloppe = [{ proprietes: result.proprietes }];
+        const enrichissement = wantsEnrichment(request.query.enrich)
+          ? await attachEnrichment(enveloppe as any)
+          : null;
+
         return reply.send({
           success: true,
           query: {
             siren,
             departement: departement || null,
           },
+          enrichissement,
           proprietaire: result.proprietaire,
           entreprise: result.entreprise,
           proprietes: result.proprietes,
@@ -130,13 +233,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           departements_concernes: result.departements_concernes,
         });
       } catch (error) {
-        console.error('Erreur recherche par SIREN:', error);
-        return reply.code(500).send({
-          success: false,
-          error: 'Erreur interne du serveur',
-          code: 'INTERNAL_ERROR',
-          details: error instanceof Error ? error.message : 'Erreur inconnue',
-        });
+        return sendServerError(reply, 'recherche par SIREN', error);
       }
     }
   );
@@ -160,31 +257,32 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       try {
         const { resultats, total_proprietaires, total_lots } = await searchByDenomination(denomination, departement, clampLimit(limit));
 
+        const payload = resultats.map(r => ({
+          proprietaire: r.proprietaire,
+          entreprise: r.entreprise,
+          proprietes: r.proprietes,
+          nombre_adresses: r.nombre_adresses,
+          nombre_lots: r.nombre_lots,
+          departements_concernes: r.departements_concernes,
+        }));
+
+        const enrichissement = wantsEnrichment(request.query.enrich)
+          ? await attachEnrichment(payload)
+          : null;
+
         return reply.send({
           success: true,
           query: {
             denomination,
             departement: departement || null,
           },
-          resultats: resultats.map(r => ({
-            proprietaire: r.proprietaire,
-            entreprise: r.entreprise,
-            proprietes: r.proprietes,
-            nombre_adresses: r.nombre_adresses,
-            nombre_lots: r.nombre_lots,
-            departements_concernes: r.departements_concernes,
-          })),
+          resultats: payload,
           total_proprietaires,
           total_lots,
+          enrichissement,
         });
       } catch (error) {
-        console.error('Erreur recherche par dénomination:', error);
-        return reply.code(500).send({
-          success: false,
-          error: 'Erreur interne du serveur',
-          code: 'INTERNAL_ERROR',
-          details: error instanceof Error ? error.message : 'Erreur inconnue',
-        });
+        return sendServerError(reply, 'recherche par dénomination', error);
       }
     }
   );
@@ -374,12 +472,17 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
         } catch (error) {
           console.error('Erreur recherche géographique (stream):', error);
           if (!clientClosed) {
+            const incidentId = randomUUID().slice(0, 8);
+            console.error(
+              `[search/geo:stream] incident=${incidentId}`,
+              error instanceof Error ? error.stack || error.message : error
+            );
             writeAndFlush(JSON.stringify({
               type: 'error',
               success: false,
               error: 'Erreur interne du serveur',
               code: 'INTERNAL_ERROR',
-              details: error instanceof Error ? error.message : 'Erreur inconnue',
+              incident_id: incidentId,
               timestamp: new Date().toISOString(),
             }) + '\n');
           }
@@ -394,12 +497,17 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       try {
         const result = await searchByPolygon(polygon, effectiveLimit);
 
+        const enrichissement = wantsEnrichment(request.body.enrich)
+          ? await attachEnrichment(result.resultats as any)
+          : null;
+
         return reply.send({
           success: true,
           query: {
             polygon_points: polygon.length,
             limit: limit || 'illimité',
           },
+          enrichissement,
           count: result.total_proprietaires,
           proprietaires: result.resultats,
           total_proprietaires: result.total_proprietaires,
@@ -412,13 +520,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           debug: result.debug,
         });
       } catch (error) {
-        console.error('Erreur recherche géographique:', error);
-        return reply.code(500).send({
-          success: false,
-          error: 'Erreur interne du serveur',
-          code: 'INTERNAL_ERROR',
-          details: error instanceof Error ? error.message : 'Erreur inconnue',
-        });
+        return sendServerError(reply, 'recherche géographique', error);
       }
     }
   );
@@ -452,6 +554,10 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       try {
         const result = await searchByRadius(longitude, latitude, radius_meters, limit || 1000);
 
+        const enrichissement = wantsEnrichment(request.body.enrich)
+          ? await attachEnrichment(result.resultats as any)
+          : null;
+
         return reply.send({
           success: true,
           query: {
@@ -460,6 +566,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
             radius_meters,
             limit: limit || 1000,
           },
+          enrichissement,
           count: result.total_proprietaires,
           proprietaires: result.resultats,
           total_proprietaires: result.total_proprietaires,
@@ -467,13 +574,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           limites_appliquees: result.limites_appliquees,
         });
       } catch (error) {
-        console.error('Erreur recherche par rayon:', error);
-        return reply.code(500).send({
-          success: false,
-          error: 'Erreur interne du serveur',
-          code: 'INTERNAL_ERROR',
-          details: error instanceof Error ? error.message : 'Erreur inconnue',
-        });
+        return sendServerError(reply, 'recherche par rayon', error);
       }
     }
   );
@@ -491,13 +592,7 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           stats,
         });
       } catch (error) {
-        console.error('Erreur stats géocodage:', error);
-        return reply.code(500).send({
-          success: false,
-          error: 'Erreur interne du serveur',
-          code: 'INTERNAL_ERROR',
-          details: error instanceof Error ? error.message : 'Erreur inconnue',
-        });
+        return sendServerError(reply, 'stats géocodage', error);
       }
     }
   );
@@ -528,8 +623,8 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       try {
-        const enrichmentMap = await enrichParcelles(parcelles);
-        const results: Record<string, any> = {};
+        const { results: enrichmentMap, failures } = await enrichParcellesDetailed(parcelles);
+        const results: Record<string, ParcelleEnrichment> = {};
         for (const [key, value] of enrichmentMap) {
           results[key] = value;
         }
@@ -539,15 +634,12 @@ export async function searchRoutes(fastify: FastifyInstance): Promise<void> {
           enrichissement: results,
           total: Object.keys(results).length,
           parcelles_demandees: parcelles.length,
+          // Une source en echec n'est pas une absence de donnee : l'appelant
+          // doit pouvoir afficher "indisponible" plutot qu'un resultat vide.
+          sources_en_echec: failures,
         });
       } catch (error) {
-        console.error('Erreur enrichissement:', error);
-        return reply.code(500).send({
-          success: false,
-          error: 'Erreur interne du serveur',
-          code: 'INTERNAL_ERROR',
-          details: error instanceof Error ? error.message : 'Erreur inconnue',
-        });
+        return sendServerError(reply, 'enrichissement', error);
       }
     }
   );

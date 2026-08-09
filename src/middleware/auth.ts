@@ -54,7 +54,46 @@ export async function validateApiKey(
   // - Logging des requêtes
 }
 
+/**
+ * Verifie la cle d'ADMINISTRATION, distincte de la cle de recherche.
+ *
+ * Les routes protegees par ce hook executent du DDL sur la base cadastrale.
+ * Une cle de recherche, meme valide, ne doit jamais les ouvrir : elle est
+ * distribuee au frontend et a deja ete publiee une fois.
+ */
+export async function validateAdminApiKey(
+  request: FastifyRequest,
+  reply: FastifyReply
+): Promise<void> {
+  const apiKey = request.headers['x-admin-api-key'] as string;
+
+  if (!config.auth.adminApiKey) {
+    reply.code(404).send({
+      success: false,
+      error: 'Route indisponible',
+      code: 'ADMIN_DISABLED',
+    });
+    return;
+  }
+
+  if (!apiKey || !safeCompare(apiKey, config.auth.adminApiKey)) {
+    // Meme reponse qu'une cle absente : ne pas indiquer a l'appelant s'il a
+    // trouve le bon header.
+    reply.code(403).send({
+      success: false,
+      error: 'Acces refuse',
+      code: 'INVALID_ADMIN_KEY',
+    });
+    return;
+  }
+}
+
 // Décorateur pour les routes protégées
 export const authHook = {
   preHandler: validateApiKey,
+};
+
+/** Décorateur pour les routes d'administration (DDL). */
+export const adminAuthHook = {
+  preHandler: validateAdminApiKey,
 };

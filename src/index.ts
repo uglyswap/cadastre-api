@@ -54,7 +54,15 @@ async function setupServer() {
   // Enregistrer les routes
   await fastify.register(healthRoutes);
   await fastify.register(searchRoutes);
-  await fastify.register(adminRoutes);
+  // Les routes d'administration executent du DDL et declenchent un
+  // telechargement de 1,5 Go. Elles alimentent une table qu'aucune route de
+  // recherche n'interroge : on ne les expose que sur demande explicite.
+  if (config.features.banPipelineEnabled) {
+    await fastify.register(adminRoutes);
+    fastify.log.warn('Pipeline BAN ACTIF : routes /admin exposees (cle ADMIN_API_KEY requise)');
+  } else {
+    fastify.log.info('Pipeline BAN desactive (BAN_PIPELINE_ENABLED != true), routes /admin non enregistrees');
+  }
 
   // Gestionnaire d'erreur global
   fastify.setErrorHandler((error: Error & { statusCode?: number }, _request, reply) => {

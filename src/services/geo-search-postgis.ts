@@ -21,6 +21,7 @@ import {
   formatAdresseComplete,
   normalizeNomVoie,
 } from '../utils/abbreviations.js';
+import { buildIdu } from '../utils/parcelle.js';
 
 // Limites pour la recherche géographique
 const MAX_RESULTS = 10000;
@@ -44,9 +45,50 @@ interface ProprietaireGeoRaw {
   denomination: string;
   forme_juridique: string;
   ban_type: string;
+  // Colonnes presentes dans proprietaires_geo depuis l'origine et jamais lues.
+  // ban_postcode est renseignee pour la quasi-totalite des lignes geocodees :
+  // son absence dans les SELECT etait la cause directe du blocage du module
+  // courrier, qui rejette tout destinataire sans code postal.
+  ban_postcode?: string | null;
+  ban_city?: string | null;
+  ban_label?: string | null;
+  contenance_parcelle?: number | null;
   lon?: number;
   lat?: number;
 }
+
+/**
+ * Liste de colonnes partagee par toutes les requetes de recherche.
+ * Centralisee pour qu'aucune requete ne puisse a nouveau oublier une colonne
+ * (l'oubli de ban_postcode dans les quatre SELECT est exactement ce qui a rendu
+ * le produit inoperant).
+ */
+const PROPRIETAIRE_COLUMNS = `
+  id,
+  departement,
+  code_commune,
+  nom_commune,
+  prefixe_section,
+  section,
+  numero_plan,
+  numero_voirie,
+  nature_voie,
+  nom_voie,
+  adresse_complete,
+  siren,
+  denomination,
+  forme_juridique,
+  ban_type,
+  ban_postcode,
+  ban_city,
+  ban_label,
+  contenance_parcelle`;
+
+/** Meme liste, prefixee pour les requetes qui aliasent la table en `p`. */
+const PROPRIETAIRE_COLUMNS_P = PROPRIETAIRE_COLUMNS.replace(
+  /^(\s*)([a-z_]+)/gm,
+  '$1p.$2'
+);
 
 /**
  * Convertit un polygone GeoJSON en WKT pour PostGIS
@@ -71,15 +113,20 @@ function transformToPropiete(raw: ProprietaireGeoRaw): {
   localisation: LocalisationLocal;
   proprietaire: Proprietaire;
 } {
+  // Le code postal vient du geocodage BAN. Il etait code en dur a la chaine
+  // vide, ce qui faisait rejeter en HTTP 400 tout destinataire par le module
+  // courrier : aucune lettre ne pouvait partir, quel que soit l'etat du schema.
   const adresse: Adresse & { latitude?: number; longitude?: number } = {
     numero: raw.numero_voirie || '',
     indice_repetition: '',
     type_voie: decodeNatureVoie(raw.nature_voie),
     nom_voie: normalizeNomVoie(raw.nom_voie),
-    code_postal: '',
-    commune: raw.nom_commune || '',
+    code_postal: (raw.ban_postcode || '').trim(),
+    // ban_city est la commune normalisee par la BAN : plus fiable pour un
+    // acheminement postal que le nom de commune cadastral.
+    commune: (raw.ban_city || raw.nom_commune || '').trim(),
     departement: raw.departement || '',
-    adresse_complete: raw.adresse_complete || formatAdresseComplete(
+    adresse_complete: raw.adresse_complete || raw.ban_label || formatAdresseComplete(
       raw.numero_voirie,
       '',
       raw.nature_voie,
@@ -91,12 +138,16 @@ function transformToPropiete(raw: ProprietaireGeoRaw): {
     longitude: raw.lon,
   };
 
-  const reference_cadastrale: ReferenceCadastrale = {
+  const iduParts = {
     departement: raw.departement || '',
     code_commune: raw.code_commune || '',
     prefixe: raw.prefixe_section || null,
     section: raw.section || '',
     numero_plan: raw.numero_plan || '',
+  };
+
+  const reference_cadastrale: ReferenceCadastrale = {
+    ...iduParts,
     reference_complete: [
       raw.departement,
       raw.code_commune,
@@ -104,6 +155,11 @@ function transformToPropiete(raw: ProprietaireGeoRaw): {
       raw.section,
       raw.numero_plan,
     ].filter(Boolean).join('-'),
+    // Calcule ici, cote backend, qui est le seul a connaitre le format des
+    // colonnes sources. Le frontend reconstruisait cette cle de son cote a
+    // partir d'une reference a longueur variable.
+    idu: buildIdu(iduParts),
+    contenance_m2: raw.contenance_parcelle ?? null,
   };
 
   const localisation: LocalisationLocal = {
@@ -324,22 +380,7 @@ export async function searchByAddressPostgis(
     params.push(maxResults * 10); // On récupère plus pour grouper ensuite
 
     const query = `
-      SELECT 
-        id,
-        departement,
-        code_commune,
-        nom_commune,
-        prefixe_section,
-        section,
-        numero_plan,
-        numero_voirie,
-        nature_voie,
-        nom_voie,
-        adresse_complete,
-        siren,
-        denomination,
-        forme_juridique,
-        ban_type,
+      SELECT ${PROPRIETAIRE_COLUMNS},
         ST_X(geom) as lon,
         ST_Y(geom) as lat
       FROM proprietaires_geo
@@ -444,8 +485,13 @@ export async function searchByAddressPostgis(
       },
     };
   } catch (error) {
+    // On ne renvoie PLUS un resultat vide sur erreur. Un catch silencieux
+    // transformait une panne de base en "0 resultat" avec un HTTP 200, donc
+    // indiscernable d'une recherche infructueuse : c'est ce mecanisme qui a
+    // laisse la panne invisible pendant des mois. La route appelante convertit
+    // l'exception en HTTP 500.
     console.error('[searchByAddressPostgis] Erreur:', error);
-    return emptyResult;
+    throw error;
   }
 }
 
@@ -546,21 +592,7 @@ export async function searchByPolygonStreaming(
         LIMIT $2
       )
       SELECT 
-        p.id,
-        p.departement,
-        p.code_commune,
-        p.nom_commune,
-        p.prefixe_section,
-        p.section,
-        p.numero_plan,
-        p.numero_voirie,
-        p.nature_voie,
-        p.nom_voie,
-        p.adresse_complete,
-        p.siren,
-        p.denomination,
-        p.forme_juridique,
-        p.ban_type,
+${PROPRIETAIRE_COLUMNS_P},
         ST_X(p.geom) as lon,
         ST_Y(p.geom) as lat
       FROM proprietaires_geo p
@@ -768,21 +800,7 @@ export async function searchByPolygon(
         LIMIT $2
       )
       SELECT 
-        p.id,
-        p.departement,
-        p.code_commune,
-        p.nom_commune,
-        p.prefixe_section,
-        p.section,
-        p.numero_plan,
-        p.numero_voirie,
-        p.nature_voie,
-        p.nom_voie,
-        p.adresse_complete,
-        p.siren,
-        p.denomination,
-        p.forme_juridique,
-        p.ban_type,
+${PROPRIETAIRE_COLUMNS_P},
         ST_X(p.geom) as lon,
         ST_Y(p.geom) as lat
       FROM proprietaires_geo p
@@ -884,15 +902,9 @@ export async function searchByPolygon(
       },
     };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Erreur inconnue';
+    // Propagation volontaire : voir searchByAddressPostgis.
     console.error('[geo-search-postgis] Erreur critique:', error);
-    return { 
-      ...emptyResult, 
-      debug: { 
-        wkt, 
-        error: errorMessage 
-      } 
-    };
+    throw error;
   }
 }
 
@@ -995,21 +1007,7 @@ export async function searchByRadius(
         LIMIT $4
       )
       SELECT 
-        p.id,
-        p.departement,
-        p.code_commune,
-        p.nom_commune,
-        p.prefixe_section,
-        p.section,
-        p.numero_plan,
-        p.numero_voirie,
-        p.nature_voie,
-        p.nom_voie,
-        p.adresse_complete,
-        p.siren,
-        p.denomination,
-        p.forme_juridique,
-        p.ban_type,
+${PROPRIETAIRE_COLUMNS_P},
         ST_X(p.geom) as lon,
         ST_Y(p.geom) as lat,
         ST_Distance(p.geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) as distance
@@ -1090,7 +1088,8 @@ export async function searchByRadius(
       },
     };
   } catch (error) {
+    // Propagation volontaire : voir searchByAddressPostgis.
     console.error('[geo-search-postgis] Erreur searchByRadius:', error);
-    return emptyResult;
+    throw error;
   }
 }

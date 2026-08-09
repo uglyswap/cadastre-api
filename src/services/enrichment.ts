@@ -1,241 +1,569 @@
 /**
- * Service d'enrichissement immobilier
- * Croise les données DVF, BDNB et Copro pour enrichir les résultats de recherche
+ * Service d'enrichissement immobilier.
+ *
+ * Croise, pour un lot de parcelles identifiees par leur IDU :
+ *   - dvf.mutations                    -> historique des ventes et dernier prix
+ *   - bdnb_<millesime>.*               -> caracteristiques du bati, surface geometrique
+ *   - copro.coproprietes               -> statut de copropriete
+ *   - cadastre_geo.parcelles_cadastre  -> contenance cadastrale de reference
+ *
+ * DEUX POINTS DE CORRECTION STRUCTURANTS PAR RAPPORT A LA VERSION PRECEDENTE
+ *
+ * 1. Agregation au niveau MUTATION.
+ *    Dans DVF, `valeur_fonciere` est le prix de la mutation entiere et il est
+ *    REPETE sur chacune de ses lignes (une ligne par local, par lot et par
+ *    parcelle). Diviser `valeur_fonciere / surface_reelle_bati` ligne a ligne,
+ *    comme le faisait la version precedente, produit un prix au m2 faux des
+ *    qu'une vente porte sur plus d'un local, et sommer les valeurs foncieres
+ *    compte le meme prix plusieurs fois. On agrege donc par (id_parcelle,
+ *    id_mutation) AVANT tout calcul.
+ *
+ * 2. Le foncier nu n'est plus invisible.
+ *    Les filtres `surface_reelle_bati > 0 AND code_type_local != 3` excluaient
+ *    toutes les ventes de terrain nu, c'est-a-dire precisement la cible d'un
+ *    promoteur. On conserve desormais toutes les mutations valorisees et on
+ *    calcule un prix au m2 de terrain quand il n'y a pas de bati.
+ *
+ * Le prix retourne est une donnee publique horodatee, pas une estimation :
+ * `valeur_fonciere` est le montant reellement enregistre par l'administration
+ * fiscale pour la mutation.
  */
 
 import { Pool } from 'pg';
+import { ParcelleEnrichment, VenteDVF } from '../types/index.js';
 
-// Pool dédié vers la base immo_data (enrichissement)
-// Aucun secret en dur: le mot de passe provient exclusivement de l'environnement.
-const enrichPool = new Pool({
-  host: process.env.ENRICH_DB_HOST || '172.17.0.1',
-  port: parseInt(process.env.ENRICH_DB_PORT || '5434'),
-  database: 'immo_data',
-  user: process.env.ENRICH_DB_USER || 'immo',
-  password: process.env.ENRICH_DB_PASSWORD || '',
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
-enrichPool.on('error', (err) => {
-  console.error('[ENRICH] Erreur pool immo_data (client idle):', err.message);
-});
+// Les types de donnees sont definis dans types/index.ts (contrat d'API) et
+// re-exportes ici pour les appelants historiques.
+export type { ParcelleEnrichment, VenteDVF };
 
-// Pool dédié vers la base cadastre_geo (surface parcelle)
-const cadastrePool = new Pool({
-  host: process.env.CADASTRE_DB_HOST || '172.17.0.1',
-  port: parseInt(process.env.CADASTRE_DB_PORT || '5434'),
-  database: 'cadastre_geo',
-  user: process.env.CADASTRE_DB_USER || 'immo',
-  password: process.env.CADASTRE_DB_PASSWORD || '',
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
-cadastrePool.on('error', (err) => {
-  console.error('[ENRICH] Erreur pool cadastre_geo (client idle):', err.message);
-});
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface EnrichmentOutcome {
+  results: Map<string, ParcelleEnrichment>;
+  /**
+   * Sources en echec technique. Une source en echec n'est PAS une absence de
+   * donnee : l'appelant doit pouvoir le signaler plutot que d'afficher un
+   * resultat vide qui ressemble a une reponse valide.
+   */
+  failures: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Configuration et pools
+// ---------------------------------------------------------------------------
+
+/** Nombre de ventes conservees dans l'historique par parcelle. */
+const MAX_VENTES_HISTORIQUE = 10;
+
+/** Plafond de parcelles par appel, aligne sur la route /search/enrich. */
+export const MAX_PARCELLES_PAR_APPEL = 200;
 
 /**
- * Enrichit un batch de parcelles avec les données DVF, BDNB et Copro
+ * Le millesime BDNB change a chaque edition et le nom de schema etait code en
+ * dur : a la prochaine edition toutes les requetes d'enrichissement auraient
+ * echoue, silencieusement puisque les erreurs etaient avalees. On resout donc
+ * le schema une fois au demarrage, avec l'environnement comme valeur preferee
+ * et une detection automatique en repli.
  */
-export async function enrichParcelles(parcelleIds: string[]): Promise<Map<string, any>> {
-  if (parcelleIds.length === 0) return new Map();
+const BDNB_SCHEMA_ENV = process.env.BDNB_SCHEMA || '';
+const BDNB_SCHEMA_FALLBACK = 'bdnb_2025_07_a_open_data';
+let bdnbSchemaCache: string | null = null;
 
-  const unique = [...new Set(parcelleIds)];
-  const results = new Map<string, any>();
+function requireDbPassword(varName: string): string {
+  const value = process.env[varName];
+  if (!value) {
+    // Fail-closed : un mot de passe vide produisait une connexion refusee dont
+    // l'erreur etait avalee plus bas, donc un enrichissement toujours vide et
+    // jamais diagnostique.
+    throw new Error(
+      `[ENRICH] Variable d'environnement ${varName} manquante : enrichissement desactive`
+    );
+  }
+  return value;
+}
 
-  // Initialize results for all parcelles
-  for (const pid of unique) {
-    results.set(pid, {
-      type_bien: null,
-      surface_parcelle: null,
-      surface_batie: null,
-      prix_m2: null,
-      date_derniere_transaction: null,
-      nb_transactions: 0,
-      est_copropriete: false,
-      nb_lots_total: null,
-      nb_lots_habitation: null,
-      nb_lots_tertiaire: null,
-      nom_copropriete: null,
-      annee_construction: null,
-      nb_niveaux: null,
-      nb_logements: null,
-      surface_lots_carrez: null,
-      type_transaction: null,
-      valeur_fonciere: null,
-      premiere_transaction: null,
+let enrichPoolInstance: Pool | null = null;
+let cadastrePoolInstance: Pool | null = null;
+
+function getEnrichPool(): Pool {
+  if (!enrichPoolInstance) {
+    enrichPoolInstance = new Pool({
+      host: process.env.ENRICH_DB_HOST || '172.17.0.1',
+      port: parseInt(process.env.ENRICH_DB_PORT || '5434'),
+      database: process.env.ENRICH_DB_NAME || 'immo_data',
+      user: process.env.ENRICH_DB_USER || 'immo',
+      password: requireDbPassword('ENRICH_DB_PASSWORD'),
+      max: 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+      statement_timeout: parseInt(process.env.ENRICH_STATEMENT_TIMEOUT_MS || '25000'),
+    });
+    enrichPoolInstance.on('error', (err) => {
+      console.error('[ENRICH] Erreur pool immo_data (client idle):', err.message);
     });
   }
+  return enrichPoolInstance;
+}
 
-  try {
-    // 1. Query DVF + BDNB + Copro from immo_data
-    const enrichQuery = `
-      WITH input_parcelles AS (
-        SELECT unnest($1::text[]) as parcelle_id
-      ),
-      dvf_last AS (
-        SELECT DISTINCT ON (id_parcelle)
-          id_parcelle,
-          (valeur_fonciere / NULLIF(surface_reelle_bati, 0))::int as prix_m2,
-          surface_reelle_bati::int as surface_batie,
-          date_mutation::text as derniere_transaction,
-          type_local,
-          valeur_fonciere,
-          lot1_surface_carrez, lot2_surface_carrez, lot3_surface_carrez,
-          lot4_surface_carrez, lot5_surface_carrez
-        FROM dvf.mutations 
-        WHERE id_parcelle = ANY($1)
-          AND valeur_fonciere > 0
-          AND surface_reelle_bati > 0
-          AND code_type_local != 3
-        ORDER BY id_parcelle, date_mutation DESC, valeur_fonciere DESC
-      ),
-      dvf_count AS (
-        SELECT id_parcelle, COUNT(*) as nb_transactions, MIN(date_mutation)::text as premiere_transaction
-        FROM dvf.mutations 
-        WHERE id_parcelle = ANY($1) AND valeur_fonciere > 0
-        GROUP BY id_parcelle
-      ),
-      dvf_agg AS (
-        SELECT 
-          dl.id_parcelle,
-          dl.prix_m2,
-          dl.surface_batie,
-          dl.derniere_transaction,
-          dc.nb_transactions,
-          dc.premiere_transaction,
-          dl.type_local,
-          COALESCE(dl.lot1_surface_carrez, 0) + COALESCE(dl.lot2_surface_carrez, 0) + 
-          COALESCE(dl.lot3_surface_carrez, 0) + COALESCE(dl.lot4_surface_carrez, 0) + 
-          COALESCE(dl.lot5_surface_carrez, 0) as surface_lots_carrez
-        FROM dvf_last dl
-        LEFT JOIN dvf_count dc ON dc.id_parcelle = dl.id_parcelle
-      ),
-      bdnb_data AS (
-        SELECT DISTINCT ON (rbgp.parcelle_id)
-          rbgp.parcelle_id,
-          ffo.usage_niveau_1_txt,
-          ffo.nb_log,
-          ffo.nb_niveau,
-          ffo.annee_construction,
-          ffo.mat_mur_txt,
-          ffo.mat_toit_txt,
-          rnc.nb_lot_tot,
-          rnc.nb_lot_tertiaire,
-          rnc.l_nom_copro,
-          rnc.numero_immat_principal
-        FROM bdnb_2025_07_a_open_data.rel_batiment_groupe_parcelle rbgp
-        LEFT JOIN bdnb_2025_07_a_open_data.batiment_groupe_ffo_bat ffo 
-          ON ffo.batiment_groupe_id = rbgp.batiment_groupe_id
-        LEFT JOIN bdnb_2025_07_a_open_data.batiment_groupe_rnc rnc 
-          ON rnc.batiment_groupe_id = rbgp.batiment_groupe_id
-        WHERE rbgp.parcelle_id = ANY($1)
-        ORDER BY rbgp.parcelle_id, ffo.nb_log DESC NULLS LAST
-      ),
-      copro_data AS (
-        SELECT DISTINCT ON (reference_cadastrale_1)
-          reference_cadastrale_1 as parcelle_id,
-          nom_d_usage_de_la_copropriete as nom_copro,
-          nombre_total_de_lots,
-          nombre_de_lots_a_usage_d_habitation,
-          periode_de_construction
-        FROM copro.coproprietes
-        WHERE reference_cadastrale_1 = ANY($1)
-      )
-      SELECT 
-        ip.parcelle_id,
-        d.prix_m2,
-        d.surface_batie,
-        d.derniere_transaction,
-        d.nb_transactions,
-        d.premiere_transaction,
-        d.type_local,
-        d.surface_lots_carrez,
-        b.usage_niveau_1_txt as type_bien,
-        b.nb_log,
-        b.nb_niveau as nb_niveaux_bdnb,
-        b.annee_construction as annee_construction_bdnb,
-        b.mat_mur_txt,
-        b.mat_toit_txt,
-        b.nb_lot_tot,
-        b.nb_lot_tertiaire,
-        b.l_nom_copro,
-        b.numero_immat_principal,
-        c.nom_copro,
-        c.nombre_total_de_lots,
-        c.nombre_de_lots_a_usage_d_habitation,
-        c.periode_de_construction
-      FROM input_parcelles ip
-      LEFT JOIN dvf_agg d ON d.id_parcelle = ip.parcelle_id
-      LEFT JOIN bdnb_data b ON b.parcelle_id = ip.parcelle_id
-      LEFT JOIN copro_data c ON c.parcelle_id = ip.parcelle_id
-    `;
-
-    const enrichResult = await enrichPool.query(enrichQuery, [unique]);
-
-    // Populate from DVF/BDNB/Copro
-    for (const row of enrichResult.rows) {
-      const pid = row.parcelle_id;
-      if (!pid) continue;
-
-      const existing = results.get(pid) || {};
-      const estCopro = !!(row.nb_lot_tot || row.nombre_total_de_lots || row.l_nom_copro || row.nom_copro);
-
-      results.set(pid, {
-        ...existing,
-        type_bien: row.type_bien || existing.type_bien,
-        surface_batie: row.surface_batie || existing.surface_batie,
-        prix_m2: row.prix_m2 || existing.prix_m2,
-        date_derniere_transaction: row.derniere_transaction || existing.date_derniere_transaction,
-        nb_transactions: row.nb_transactions ? parseInt(row.nb_transactions) : existing.nb_transactions,
-        est_copropriete: estCopro || existing.est_copropriete,
-        nb_lots_total: row.nombre_total_de_lots || row.nb_lot_tot || existing.nb_lots_total,
-        nb_lots_habitation: row.nombre_de_lots_a_usage_d_habitation || existing.nb_lots_habitation,
-        nb_lots_tertiaire: row.nb_lot_tertiaire || existing.nb_lots_tertiaire,
-        nom_copropriete: row.nom_copro || row.l_nom_copro || existing.nom_copropriete,
-        annee_construction: row.periode_de_construction || row.annee_construction_bdnb || existing.annee_construction,
-        nb_niveaux: row.nb_niveaux_bdnb || existing.nb_niveaux,
-        nb_logements: row.nb_log || existing.nb_logements,
-        surface_lots_carrez: row.surface_lots_carrez || existing.surface_lots_carrez,
-        type_transaction: row.type_local || existing.type_transaction,
-        premiere_transaction: row.premiere_transaction || existing.premiere_transaction,
-      });
-    }
-
-    // 2. Query surface parcelle from cadastre_geo
-    try {
-      const surfaceQuery = `
-        SELECT idu as parcelle_id, contenance as surface_parcelle_m2
-        FROM parcelles_cadastre
-        WHERE idu = ANY($1)
-      `;
-      const surfaceResult = await cadastrePool.query(surfaceQuery, [unique]);
-
-      for (const row of surfaceResult.rows) {
-        const pid = row.parcelle_id;
-        if (!pid) continue;
-        const existing = results.get(pid);
-        if (existing) {
-          existing.surface_parcelle = row.surface_parcelle_m2 || existing.surface_parcelle;
-        }
-      }
-    } catch (err) {
-      console.error('[ENRICH] Erreur requete surface parcelle:', err);
-    }
-
-  } catch (error) {
-    console.error('[ENRICH] Erreur enrichissement:', error);
+function getCadastrePool(): Pool {
+  if (!cadastrePoolInstance) {
+    cadastrePoolInstance = new Pool({
+      host: process.env.CADASTRE_DB_HOST || '172.17.0.1',
+      port: parseInt(process.env.CADASTRE_DB_PORT || '5434'),
+      database: process.env.CADASTRE_DB_NAME || 'cadastre_geo',
+      user: process.env.CADASTRE_DB_USER || 'immo',
+      password: requireDbPassword('CADASTRE_DB_PASSWORD'),
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+      statement_timeout: parseInt(process.env.ENRICH_STATEMENT_TIMEOUT_MS || '25000'),
+    });
+    cadastrePoolInstance.on('error', (err) => {
+      console.error('[ENRICH] Erreur pool cadastre_geo (client idle):', err.message);
+    });
   }
-
-  return results;
+  return cadastrePoolInstance;
 }
 
 /**
- * Enrichit une seule parcelle
+ * Determine le schema BDNB reellement present. Les noms sont millesimes
+ * (`bdnb_2025_07_a_open_data`) : on prend le plus recent par ordre alphabetique,
+ * qui est aussi le plus recent chronologiquement vu le format de nommage.
  */
-export async function enrichParcelle(parcelleId: string): Promise<any | null> {
-  const results = await enrichParcelles([parcelleId]);
+async function resolveBdnbSchema(): Promise<string> {
+  if (bdnbSchemaCache) return bdnbSchemaCache;
+
+  if (BDNB_SCHEMA_ENV) {
+    bdnbSchemaCache = BDNB_SCHEMA_ENV;
+    return bdnbSchemaCache;
+  }
+
+  try {
+    const res = await getEnrichPool().query<{ schema_name: string }>(
+      `SELECT schema_name
+         FROM information_schema.schemata
+        WHERE schema_name LIKE 'bdnb%'
+        ORDER BY schema_name DESC
+        LIMIT 1`
+    );
+    if (res.rows.length > 0) {
+      bdnbSchemaCache = res.rows[0].schema_name;
+      if (bdnbSchemaCache !== BDNB_SCHEMA_FALLBACK) {
+        console.warn(
+          `[ENRICH] Millesime BDNB detecte: ${bdnbSchemaCache} (attendu ${BDNB_SCHEMA_FALLBACK})`
+        );
+      }
+      return bdnbSchemaCache;
+    }
+  } catch (err) {
+    console.error('[ENRICH] Detection du schema BDNB impossible:', (err as Error).message);
+  }
+
+  bdnbSchemaCache = BDNB_SCHEMA_FALLBACK;
+  return bdnbSchemaCache;
+}
+
+/**
+ * Un identifiant de schema ne peut pas etre passe en parametre lie : on le
+ * valide strictement avant interpolation pour eliminer tout risque d'injection.
+ */
+function assertSafeIdentifier(identifier: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/.test(identifier)) {
+    throw new Error(`[ENRICH] Nom de schema invalide: ${identifier}`);
+  }
+  return identifier;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers de conversion
+// ---------------------------------------------------------------------------
+
+function toNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const n = typeof value === 'number' ? value : Number(String(value).replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
+}
+
+function toInt(value: unknown): number | null {
+  const n = toNumber(value);
+  return n === null ? null : Math.round(n);
+}
+
+function emptyEnrichment(idu: string): ParcelleEnrichment {
+  return {
+    idu,
+    surface_parcelle_m2: null,
+    surface_geometrique_m2: null,
+    derniere_vente: null,
+    ventes: [],
+    nb_transactions: 0,
+    premiere_transaction: null,
+    type_bien: null,
+    annee_construction: null,
+    nb_niveaux: null,
+    nb_logements: null,
+    materiau_mur: null,
+    materiau_toit: null,
+    est_copropriete: false,
+    nom_copropriete: null,
+    nb_lots_total: null,
+    nb_lots_habitation: null,
+    nb_lots_tertiaire: null,
+    nb_lots_stationnement: null,
+    periode_construction: null,
+    foncier_nu: false,
+    sources: { dvf: false, bdnb: false, copro: false, cadastre: false },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Requetes
+// ---------------------------------------------------------------------------
+
+/**
+ * Historique des mutations par parcelle, agrege au niveau mutation.
+ *
+ * La fenetre `ROW_NUMBER` classe les mutations de chaque parcelle par date
+ * decroissante : la ligne rn = 1 est la derniere vente enregistree.
+ */
+async function queryDvf(idus: string[]): Promise<Map<string, VenteDVF[]>> {
+  const sql = `
+    WITH mut_parcelle AS (
+      SELECT
+        m.id_parcelle,
+        m.id_mutation,
+        MAX(m.date_mutation)                            AS date_mutation,
+        MAX(m.nature_mutation)                          AS nature_mutation,
+        MAX(m.valeur_fonciere)                          AS valeur_fonciere,
+        SUM(COALESCE(m.surface_reelle_bati, 0))         AS surface_bati,
+        MAX(COALESCE(m.surface_terrain, 0))             AS surface_terrain,
+        MAX(m.type_local)                               AS type_local,
+        MAX(m.nombre_lots)                              AS nombre_lots,
+        SUM(COALESCE(m.nombre_pieces_principales, 0))   AS nombre_pieces,
+        MAX(m.nature_culture)                           AS nature_culture
+      FROM dvf.mutations m
+      WHERE m.id_parcelle = ANY($1::text[])
+        AND m.valeur_fonciere > 0
+      GROUP BY m.id_parcelle, m.id_mutation
+    ),
+    spread AS (
+      SELECT id_mutation, COUNT(DISTINCT id_parcelle) AS parcelles_connues
+      FROM mut_parcelle
+      GROUP BY id_mutation
+    ),
+    ranked AS (
+      SELECT
+        mp.*,
+        s.parcelles_connues,
+        ROW_NUMBER() OVER (
+          PARTITION BY mp.id_parcelle
+          ORDER BY mp.date_mutation DESC, mp.valeur_fonciere DESC
+        ) AS rn
+      FROM mut_parcelle mp
+      JOIN spread s ON s.id_mutation = mp.id_mutation
+    )
+    SELECT *
+      FROM ranked
+     WHERE rn <= $2
+     ORDER BY id_parcelle, rn
+  `;
+
+  const res = await getEnrichPool().query(sql, [idus, MAX_VENTES_HISTORIQUE]);
+  const byParcelle = new Map<string, VenteDVF[]>();
+
+  for (const row of res.rows) {
+    const surfaceBati = toNumber(row.surface_bati) || 0;
+    const surfaceTerrain = toNumber(row.surface_terrain) || 0;
+    const valeur = toNumber(row.valeur_fonciere) || 0;
+    const parcellesConnues = toInt(row.parcelles_connues) || 1;
+    const fonciernu = surfaceBati <= 0 && surfaceTerrain > 0;
+
+    // Le prix au m2 n'a de sens que rapporte a une surface, et seulement si la
+    // mutation ne couvre pas plusieurs parcelles (sinon on imputerait a une
+    // parcelle le prix de plusieurs).
+    const imputable = parcellesConnues <= 1;
+
+    const vente: VenteDVF = {
+      id_mutation: String(row.id_mutation),
+      date_mutation: row.date_mutation instanceof Date
+        ? row.date_mutation.toISOString().slice(0, 10)
+        : String(row.date_mutation).slice(0, 10),
+      nature_mutation: row.nature_mutation || null,
+      valeur_fonciere: valeur,
+      surface_bati_m2: surfaceBati > 0 ? surfaceBati : null,
+      surface_terrain_m2: surfaceTerrain > 0 ? surfaceTerrain : null,
+      prix_m2_bati:
+        imputable && surfaceBati > 0 ? Math.round(valeur / surfaceBati) : null,
+      prix_m2_terrain:
+        imputable && fonciernu && surfaceTerrain > 0
+          ? Math.round(valeur / surfaceTerrain)
+          : null,
+      type_local: row.type_local || null,
+      nombre_lots: toInt(row.nombre_lots),
+      nombre_pieces: toInt(row.nombre_pieces) || null,
+      nature_culture: row.nature_culture || null,
+      foncier_nu: fonciernu,
+      parcelles_connues_dans_mutation: parcellesConnues,
+      prix_couvre_plusieurs_parcelles: parcellesConnues > 1,
+    };
+
+    const list = byParcelle.get(row.id_parcelle) || [];
+    list.push(vente);
+    byParcelle.set(row.id_parcelle, list);
+  }
+
+  return byParcelle;
+}
+
+/** Caracteristiques du bati et surface geometrique (BDNB). */
+async function queryBdnb(idus: string[]): Promise<Map<string, Record<string, unknown>>> {
+  const schema = assertSafeIdentifier(await resolveBdnbSchema());
+
+  const sql = `
+    WITH bati AS (
+      SELECT DISTINCT ON (rbgp.parcelle_id)
+        rbgp.parcelle_id,
+        ffo.usage_niveau_1_txt,
+        ffo.nb_log,
+        ffo.nb_niveau,
+        ffo.annee_construction,
+        ffo.mat_mur_txt,
+        ffo.mat_toit_txt,
+        rnc.nb_lot_tot,
+        rnc.nb_lot_tertiaire,
+        rnc.l_nom_copro
+      FROM ${schema}.rel_batiment_groupe_parcelle rbgp
+      LEFT JOIN ${schema}.batiment_groupe_ffo_bat ffo
+        ON ffo.batiment_groupe_id = rbgp.batiment_groupe_id
+      LEFT JOIN ${schema}.batiment_groupe_rnc rnc
+        ON rnc.batiment_groupe_id = rbgp.batiment_groupe_id
+      WHERE rbgp.parcelle_id = ANY($1::text[])
+      ORDER BY rbgp.parcelle_id, ffo.nb_log DESC NULLS LAST
+    ),
+    geom AS (
+      SELECT parcelle_id, s_geom_parcelle
+        FROM ${schema}.parcelle
+       WHERE parcelle_id = ANY($1::text[])
+    )
+    SELECT
+      COALESCE(b.parcelle_id, g.parcelle_id) AS parcelle_id,
+      b.usage_niveau_1_txt,
+      b.nb_log,
+      b.nb_niveau,
+      b.annee_construction,
+      b.mat_mur_txt,
+      b.mat_toit_txt,
+      b.nb_lot_tot,
+      b.nb_lot_tertiaire,
+      b.l_nom_copro,
+      g.s_geom_parcelle
+    FROM bati b
+    FULL OUTER JOIN geom g ON g.parcelle_id = b.parcelle_id
+  `;
+
+  const res = await getEnrichPool().query(sql, [idus]);
+  const map = new Map<string, Record<string, unknown>>();
+  for (const row of res.rows) {
+    if (row.parcelle_id) map.set(row.parcelle_id, row);
+  }
+  return map;
+}
+
+/**
+ * Statut de copropriete.
+ * La version precedente n'interrogeait que `reference_cadastrale_1`, ce qui
+ * ratait toute copropriete dont la parcelle est en 2e ou 3e reference : un faux
+ * negatif silencieux. On interroge les trois.
+ */
+async function queryCopro(idus: string[]): Promise<Map<string, Record<string, unknown>>> {
+  const sql = `
+    SELECT DISTINCT ON (parcelle_id) *
+    FROM (
+      SELECT reference_cadastrale_1 AS parcelle_id, nom_d_usage_de_la_copropriete,
+             nombre_total_de_lots, nombre_de_lots_a_usage_d_habitation,
+             nombre_de_lots_de_stationnement, periode_de_construction
+        FROM copro.coproprietes WHERE reference_cadastrale_1 = ANY($1::text[])
+      UNION ALL
+      SELECT reference_cadastrale_2, nom_d_usage_de_la_copropriete,
+             nombre_total_de_lots, nombre_de_lots_a_usage_d_habitation,
+             nombre_de_lots_de_stationnement, periode_de_construction
+        FROM copro.coproprietes WHERE reference_cadastrale_2 = ANY($1::text[])
+      UNION ALL
+      SELECT reference_cadastrale_3, nom_d_usage_de_la_copropriete,
+             nombre_total_de_lots, nombre_de_lots_a_usage_d_habitation,
+             nombre_de_lots_de_stationnement, periode_de_construction
+        FROM copro.coproprietes WHERE reference_cadastrale_3 = ANY($1::text[])
+    ) t
+    WHERE parcelle_id IS NOT NULL
+  `;
+
+  const res = await getEnrichPool().query(sql, [idus]);
+  const map = new Map<string, Record<string, unknown>>();
+  for (const row of res.rows) {
+    if (row.parcelle_id) map.set(row.parcelle_id, row);
+  }
+  return map;
+}
+
+/** Contenance cadastrale officielle. */
+async function queryContenance(idus: string[]): Promise<Map<string, number>> {
+  const res = await getCadastrePool().query(
+    `SELECT idu, contenance FROM parcelles_cadastre WHERE idu = ANY($1::text[])`,
+    [idus]
+  );
+  const map = new Map<string, number>();
+  for (const row of res.rows) {
+    const c = toInt(row.contenance);
+    if (row.idu && c !== null) map.set(row.idu, c);
+  }
+  return map;
+}
+
+// ---------------------------------------------------------------------------
+// Point d'entree
+// ---------------------------------------------------------------------------
+
+/**
+ * Enrichit un lot de parcelles.
+ *
+ * Les quatre sources sont interrogees en parallele et independamment : une
+ * source indisponible n'annule pas les autres, mais elle est signalee dans
+ * `failures` pour que l'appelant distingue une absence de donnee d'une panne.
+ */
+export async function enrichParcellesDetailed(
+  parcelleIds: string[]
+): Promise<EnrichmentOutcome> {
+  const unique = [...new Set(parcelleIds.filter(Boolean))];
+  const results = new Map<string, ParcelleEnrichment>();
+  const failures: string[] = [];
+
+  for (const idu of unique) {
+    results.set(idu, emptyEnrichment(idu));
+  }
+
+  if (unique.length === 0) {
+    return { results, failures };
+  }
+
+  const [dvfRes, bdnbRes, coproRes, contenanceRes] = await Promise.allSettled([
+    queryDvf(unique),
+    queryBdnb(unique),
+    queryCopro(unique),
+    queryContenance(unique),
+  ]);
+
+  // --- DVF : ventes et dernier prix -----------------------------------------
+  if (dvfRes.status === 'fulfilled') {
+    for (const [idu, ventes] of dvfRes.value) {
+      const entry = results.get(idu);
+      if (!entry) continue;
+      entry.ventes = ventes;
+      entry.derniere_vente = ventes[0] || null;
+      entry.nb_transactions = ventes.length;
+      entry.premiere_transaction = ventes.length
+        ? ventes[ventes.length - 1].date_mutation
+        : null;
+      entry.foncier_nu = ventes.length > 0 && ventes.every((v) => v.foncier_nu);
+      entry.sources.dvf = true;
+    }
+    // Une parcelle sans vente a bien ete interrogee : la source a repondu.
+    for (const idu of unique) {
+      const entry = results.get(idu);
+      if (entry) entry.sources.dvf = true;
+    }
+  } else {
+    failures.push('dvf');
+    console.error('[ENRICH] Requete DVF en echec:', dvfRes.reason?.message || dvfRes.reason);
+  }
+
+  // --- BDNB : bati et surface geometrique -----------------------------------
+  if (bdnbRes.status === 'fulfilled') {
+    for (const idu of unique) {
+      const entry = results.get(idu);
+      if (entry) entry.sources.bdnb = true;
+    }
+    for (const [idu, row] of bdnbRes.value) {
+      const entry = results.get(idu);
+      if (!entry) continue;
+      entry.type_bien = (row.usage_niveau_1_txt as string) || null;
+      entry.nb_logements = toInt(row.nb_log);
+      entry.nb_niveaux = toInt(row.nb_niveau);
+      entry.annee_construction = toInt(row.annee_construction);
+      entry.materiau_mur = (row.mat_mur_txt as string) || null;
+      entry.materiau_toit = (row.mat_toit_txt as string) || null;
+      entry.nb_lots_total = toInt(row.nb_lot_tot);
+      entry.nb_lots_tertiaire = toInt(row.nb_lot_tertiaire);
+      entry.surface_geometrique_m2 = toInt(row.s_geom_parcelle);
+      if (row.l_nom_copro) {
+        entry.nom_copropriete = row.l_nom_copro as string;
+        entry.est_copropriete = true;
+      }
+    }
+  } else {
+    failures.push('bdnb');
+    console.error('[ENRICH] Requete BDNB en echec:', bdnbRes.reason?.message || bdnbRes.reason);
+  }
+
+  // --- Copropriete -----------------------------------------------------------
+  if (coproRes.status === 'fulfilled') {
+    for (const idu of unique) {
+      const entry = results.get(idu);
+      if (entry) entry.sources.copro = true;
+    }
+    for (const [idu, row] of coproRes.value) {
+      const entry = results.get(idu);
+      if (!entry) continue;
+      entry.est_copropriete = true;
+      entry.nom_copropriete =
+        (row.nom_d_usage_de_la_copropriete as string) || entry.nom_copropriete;
+      entry.nb_lots_total = toInt(row.nombre_total_de_lots) ?? entry.nb_lots_total;
+      entry.nb_lots_habitation = toInt(row.nombre_de_lots_a_usage_d_habitation);
+      entry.nb_lots_stationnement = toInt(row.nombre_de_lots_de_stationnement);
+      entry.periode_construction = (row.periode_de_construction as string) || null;
+    }
+  } else {
+    failures.push('copro');
+    console.error('[ENRICH] Requete copro en echec:', coproRes.reason?.message || coproRes.reason);
+  }
+
+  // --- Contenance cadastrale -------------------------------------------------
+  if (contenanceRes.status === 'fulfilled') {
+    for (const idu of unique) {
+      const entry = results.get(idu);
+      if (entry) entry.sources.cadastre = true;
+    }
+    for (const [idu, contenance] of contenanceRes.value) {
+      const entry = results.get(idu);
+      if (entry) entry.surface_parcelle_m2 = contenance;
+    }
+  } else {
+    failures.push('cadastre');
+    console.error(
+      '[ENRICH] Requete contenance en echec:',
+      contenanceRes.reason?.message || contenanceRes.reason
+    );
+  }
+
+  return { results, failures };
+}
+
+/**
+ * Variante compatible avec l'appelant historique : renvoie directement la Map.
+ * Conservee pour ne casser aucun appel existant.
+ */
+export async function enrichParcelles(
+  parcelleIds: string[]
+): Promise<Map<string, ParcelleEnrichment>> {
+  const { results } = await enrichParcellesDetailed(parcelleIds);
+  return results;
+}
+
+/** Enrichit une seule parcelle. */
+export async function enrichParcelle(
+  parcelleId: string
+): Promise<ParcelleEnrichment | null> {
+  const { results } = await enrichParcellesDetailed([parcelleId]);
   return results.get(parcelleId) || null;
 }

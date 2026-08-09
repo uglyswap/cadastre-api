@@ -12,6 +12,7 @@ import {
   normalizeNomVoie,
 } from '../utils/abbreviations.js';
 import { enrichSiren } from './entreprises-api.js';
+import { buildIdu } from '../utils/parcelle.js';
 import {
   Proprietaire,
   ProprieteGroupee,
@@ -39,6 +40,11 @@ interface ProprietaireGeoRaw {
   denomination: string;
   forme_juridique: string;
   ban_type: string;
+  // Colonnes presentes en base et jamais lues jusqu'ici (cf. geo-search-postgis).
+  ban_postcode?: string | null;
+  ban_city?: string | null;
+  ban_label?: string | null;
+  contenance_parcelle?: number | null;
   lon?: number;
   lat?: number;
 }
@@ -57,10 +63,10 @@ function transformGeoToPropiete(raw: ProprietaireGeoRaw): {
     indice_repetition: '',
     type_voie: decodeNatureVoie(raw.nature_voie),
     nom_voie: normalizeNomVoie(raw.nom_voie),
-    code_postal: '',
-    commune: raw.nom_commune || '',
+    code_postal: (raw.ban_postcode || '').trim(),
+    commune: (raw.ban_city || raw.nom_commune || '').trim(),
     departement: raw.departement || '',
-    adresse_complete: raw.adresse_complete || formatAdresseComplete(
+    adresse_complete: raw.adresse_complete || raw.ban_label || formatAdresseComplete(
       raw.numero_voirie,
       '',
       raw.nature_voie,
@@ -72,12 +78,18 @@ function transformGeoToPropiete(raw: ProprietaireGeoRaw): {
     longitude: raw.lon,
   };
 
-  const reference_cadastrale: ReferenceCadastrale = {
+  const iduParts = {
     departement: raw.departement || '',
     code_commune: raw.code_commune || '',
     prefixe: raw.prefixe_section || null,
     section: raw.section || '',
     numero_plan: raw.numero_plan || '',
+  };
+
+  const reference_cadastrale: ReferenceCadastrale = {
+    ...iduParts,
+    idu: buildIdu(iduParts),
+    contenance_m2: raw.contenance_parcelle ?? null,
     reference_complete: [
       raw.departement,
       raw.code_commune,
@@ -186,6 +198,7 @@ export async function searchBySiren(
         prefixe_section, section, numero_plan,
         numero_voirie, nature_voie, nom_voie, adresse_complete,
         siren, denomination, forme_juridique, ban_type,
+        ban_postcode, ban_city, ban_label, contenance_parcelle,
         ST_X(geom) as lon, ST_Y(geom) as lat
       FROM proprietaires_geo
       WHERE ${conditions.join(' AND ')}
@@ -301,6 +314,7 @@ export async function searchByDenomination(
         prefixe_section, section, numero_plan,
         numero_voirie, nature_voie, nom_voie, adresse_complete,
         siren, denomination, forme_juridique, ban_type,
+        ban_postcode, ban_city, ban_label, contenance_parcelle,
         ST_X(geom) as lon, ST_Y(geom) as lat
       FROM proprietaires_geo
       WHERE ${conditions.join(' AND ')}
