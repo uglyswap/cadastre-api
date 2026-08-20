@@ -228,8 +228,30 @@ const TYPES_VOIE = [
 /**
  * Extrait le numéro de voirie et le nom de voie depuis une adresse
  */
-function extractAddressParts(adresse: string): { numero: string | null; nomVoie: string } {
+/**
+ * Extrait le numéro de voirie, le nom de voie et l'éventuel code postal
+ * depuis une adresse en saisie libre.
+ *
+ * Le code postal (5 chiffres) et le nom de ville qui le suit sont retirés
+ * du nom de voie : "5 rue de Bruxelles 75009 paris" donne
+ * numero=0005, nomVoie="de bruxelles", codePostal="75009".
+ */
+function extractAddressParts(adresse: string): { numero: string | null; nomVoie: string; codePostal: string | null } {
   let normalized = adresse.trim();
+
+  // Détecter un code postal (5 chiffres) dans la saisie libre.
+  // Un numéro de voirie fait au maximum 4 chiffres : toute séquence de
+  // 5 chiffres isolée est un code postal. Tout ce qui suit (nom de ville)
+  // est retiré de la voie recherchée.
+  let codePostal: string | null = null;
+  const matchCp = normalized.match(/\b(\d{5})\b/);
+  if (matchCp) {
+    codePostal = matchCp[1];
+    normalized = normalized
+      .slice(0, matchCp.index ?? normalized.length)
+      .replace(/[,;\s]+$/, '')
+      .trim();
+  }
 
   // Extraire le numéro au début (1-4 chiffres optionnellement suivi de bis/ter)
   let numero: string | null = null;
@@ -240,12 +262,12 @@ function extractAddressParts(adresse: string): { numero: string | null; nomVoie:
   }
 
   // Supprimer le type de voie s'il est au début
-  const words = normalized.toLowerCase().split(/\s+/);
+  const words = normalized.toLowerCase().split(/\s+/).filter(Boolean);
   if (words.length > 0 && TYPES_VOIE.includes(words[0])) {
     words.shift();
   }
 
-  return { numero, nomVoie: words.join(' ') };
+  return { numero, nomVoie: words.join(' '), codePostal };
 }
 
 /**
@@ -322,8 +344,9 @@ export async function searchByAddressPostgis(
 
   try {
     // Extraire le numéro et le nom de voie
-    const { numero, nomVoie } = extractAddressParts(adresse);
-    
+    // (détecte aussi un éventuel code postal présent dans la saisie libre)
+    const { numero, nomVoie, codePostal: codePostalExtrait } = extractAddressParts(adresse);
+
     if (!nomVoie || nomVoie.length < 2) {
       console.log('[searchByAddressPostgis] Nom de voie trop court');
       return emptyResult;
@@ -334,8 +357,18 @@ export async function searchByAddressPostgis(
     let communeName: string | undefined;
 
     if (codePostal) {
+      // Paramètre explicite : comportement historique, le code postal prime
       const cpFilter = codePostalToFilter(codePostal);
       effectiveDepartement = cpFilter.departement;
+      communeName = cpFilter.communeName;
+    } else if (codePostalExtrait) {
+      // Code postal détecté dans la saisie libre (ex: "5 rue de Bruxelles 75009 paris") :
+      // on en déduit le département (et la commune pour Paris/Lyon/Marseille),
+      // sans écraser un filtre département passé explicitement.
+      const cpFilter = codePostalToFilter(codePostalExtrait);
+      if (!effectiveDepartement) {
+        effectiveDepartement = cpFilter.departement;
+      }
       communeName = cpFilter.communeName;
     }
 
